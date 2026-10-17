@@ -221,6 +221,17 @@ bool Engine::initialize(const EngineOptions& options) {
     frameStats_.reset();
     fpsMax_ = config_.getInt("fps_max", 0);
 
+    matchRules_.resetMatch();
+    grenadeSystem_.clear();
+    navGraph_.buildDefaultArenaGraph(collisionWorld_);
+    botAgent_.spawn(glm::vec3(-6.5f, 0.0f, -3.5f), 180.0f);
+    demoRecorder_.beginRecording(
+        arenaData.name,
+        static_cast<float>(tickRate),
+        testMap_.playerSpawnFeetPosition(),
+        testMap_.playerSpawnYawDegrees(),
+        0.0f);
+
     initialized_ = true;
     running_ = true;
 
@@ -429,6 +440,10 @@ void Engine::fixedUpdate(double fixedDt) {
         }
         entityManager_.checkPlayerPickups(pState.feetPosition, weaponSystem_);
         entityManager_.update(dt);
+        matchRules_.update(dt);
+        grenadeSystem_.update(collisionWorld_, dt);
+        (void)botAgent_.thinkAndStep(navGraph_, collisionWorld_, &eyePos, dt);
+        demoRecorder_.recordTick(cmd, pState.feetPosition, pState.velocity, 0U);
         if (netServer_.isRunning()) {
             netServer_.pollAndSimulate(dt);
         }

@@ -51,6 +51,10 @@ set(CLASSICFPS_ENGINE_SOURCES
     engine/weapons/WeaponDef.cpp
     engine/weapons/WeaponSystem.cpp
     engine/weapons/ViewModelRenderer.cpp
+    engine/weapons/BallisticsAndProjectiles.cpp
+    engine/gameplay/MatchRules.cpp
+    engine/ai/BotAI.cpp
+    engine/replay/DemoRecorder.cpp
     engine/animation/Skeleton.cpp
     engine/resources/ModelLoader.cpp
     engine/audio/AudioEngine.cpp
@@ -148,4 +152,8 @@ if(CLASSICFPS_BUILD_TESTS)
     add_test(NAME ui.hud_crosshair_and_console        COMMAND classicfps_tests hud_and_console)
     add_test(NAME networking.udp_prediction_reconcile COMMAND classicfps_tests networking_udp)
     add_test(NAME debug.profiler_and_lifecycle        COMMAND classicfps_tests engine_lifecycle)
+    add_test(NAME gameplay.match_rules_economy_c4     COMMAND classicfps_tests match_rules)
+    add_test(NAME weapons.hitboxes_wallbang_grenades  COMMAND classicfps_tests ballistics_and_grenades)
+    add_test(NAME ai.navgraph_astar_and_bot_fsm       COMMAND classicfps_tests bot_ai)
+    add_test(NAME replay.demo_recorder_determinism    COMMAND classicfps_tests demo_replay)
 endif()

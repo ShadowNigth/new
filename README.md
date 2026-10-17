@@ -1,4 +1,4 @@
-# ClassicFPS Engine v1.0
+# ClassicFPS Engine v1.2 (Fases 1–12 Completadas)
 
 Motor FPS 3D ligero, modular y nativo para **Linux** escrito en **C++20**, inspirado en la arquitectura técnica, el determinismo de simulación y la estética clásica de **GoldSrc / Counter-Strike 1.6**.
 
@@ -6,7 +6,7 @@ Todo el código fuente, los subsistemas del motor, las texturas procedurales, lo
 
 ---
 
-## Estado del Proyecto por Fases (8/8 Fases Completadas)
+## Estado del Proyecto por Fases (12/12 Fases Completadas)
 
 - [x] **Fase 1: Núcleo ejecutable** *(Completada)*
   - Sistema de compilación CMake + C++20 con advertencias estrictas y soporte para sanitizadores (`ASan`/`UBSan`).
@@ -36,7 +36,20 @@ Todo el código fuente, los subsistemas del motor, las texturas procedurales, lo
   - Arquitectura cliente-servidor autoritativa sobre sockets UDP POSIX no bloqueantes (`engine/networking/NetSystem.*`), protocolo binario versionado (`"CFSP"` v1), envío de `ClientUserCommand`, difusión de `ServerWorldSnapshot`, **predicción en cliente** y **reconciliación con re-simulación** cuando el estado autoritativo del servidor diverge del predicho.
 - [x] **Fase 8: Optimización, perfilado y estabilidad** *(Completada)*
   - Perfilador por subsistema con temporizadores RAII (`engine/debug/Profiler.*`) que mide tiempos medios y máximos en microsegundos (`Render3D`, `HudOverlay`, `Physics`, `Weapons`, `EntitiesAndAudio`).
-  - Suite completa de **22 pruebas automatizadas en CTest** verificadas tanto en modo `Release (-O3)` como en modo `Debug` con **AddressSanitizer (`ASan`) y UndefinedBehaviorSanitizer (`UBSan`)** con 0 fugas de memoria y 0 errores.
+  - Suite completa de pruebas automatizadas en CTest verificadas tanto en modo `Release (-O3)` como en modo `Debug` con **AddressSanitizer (`ASan`) y UndefinedBehaviorSanitizer (`UBSan`)** con 0 fugas de memoria y 0 errores.
+- [x] **Fase 9: Reglas de partida táctica, rondas, economía y bomba C4** *(Completada)*
+  - Máquina de estados de rondas estilo CS 1.6 (`FreezeTime`, `LiveRound`, `BombPlanted`, `RoundEnd`) en `engine/gameplay/MatchRules.*`.
+  - Sistema de economía y compra (`BuyItemDef`, `purchaseItem`, `$800` inicial, tope `$16000`, restricción de armas por bando CT/T, mejora de Kevlar a Kevlar+Casco por `$350`, kit de desactivación).
+  - Mecánica de plantado (`3.0 s`) y desactivación de bomba C4 (`5.0 s` con kit / `10.0 s` sin kit) y daño por explosión con caída cuadrática por distancia (`computeC4ExplosionDamage`).
+- [x] **Fase 10: Balística avanzada, hitboxes anatómicos, penetración de materiales (Wallbanging) y granadas tácticas** *(Completada)*
+  - Raycasting contra **7 hitboxes anatómicos por personaje** (`Head`, `Chest`, `Stomach`, `LeftArm`, `RightArm`, `LeftLeg`, `RightLeg`) y cálculo clásico de daño + absorción de Kevlar/Casco (`computeDamageWithArmor` en `engine/weapons/BallisticsAndProjectiles.*`).
+  - **Wallbanging (`tracePenetratingShot`)**: cálculo de punto de entrada y salida a través de muros/cajas según material (`Wood`, `Plaster`, `Concrete`, `Metal`, `Grate`) y espesor atravesado.
+  - **Sistema de Granadas Tácticas (`GrenadeSystem`)**: física de proyectiles con gravedad y rebote contra `CollisionWorld` para `HEGrenade` (daño con oclusión por cobertura), `Flashbang` (ceguera direccional según ángulo de visión y línea de visión) y `SmokeGrenade` (volumen esférico de humo que bloquea línea de visión `isLineOccludedBySmoke`).
+- [x] **Fase 11: IA de bots tácticos y navegación por grafo A*** *(Completada)*
+  - Grafo de navegación por waypoints (`NavGraph` en `engine/ai/BotAI.*`) con enlazado automático por visibilidad y búsqueda de camino más corto **A* (`findPathAStar`)**.
+  - Agente táctico autónomo (`BotAgent`) con máquina de estados (`Patrol`, `MoveToObjective`, `EngageEnemy`, `SeekCover`), percepción visual por cono FOV + raycast, tiempo de reacción, apuntado suave e inyección de `PlayerCommand` sobre `FPSController`.
+- [x] **Fase 12: Grabador y reproductor determinista de demos (`.cfdemo`)** *(Completada)*
+  - Grabación y serialización binaria versionada (`"CFDM"` v1, `.cfdemo`) cuadro a cuadro (`DemoRecorder` y `DemoPlayer` en `engine/replay/DemoRecorder.*`), con control de velocidad de reproducción, salto a tick (`seekToTick`) y verificador matemático de determinismo (`verifyDeterminism` con `0.0000 m` de deriva).
 
 ---
 

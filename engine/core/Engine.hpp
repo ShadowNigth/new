@@ -1,11 +1,13 @@
 #pragma once
 
+#include "engine/ai/BotAI.hpp"
 #include "engine/audio/AudioEngine.hpp"
 #include "engine/core/Clock.hpp"
 #include "engine/core/Config.hpp"
 #include "engine/core/ResourceManager.hpp"
 #include "engine/debug/FrameStats.hpp"
 #include "engine/debug/Profiler.hpp"
+#include "engine/gameplay/MatchRules.hpp"
 #include "engine/input/InputManager.hpp"
 #include "engine/networking/NetSystem.hpp"
 #include "engine/physics/CollisionWorld.hpp"
@@ -13,7 +15,9 @@
 #include "engine/platform/Window.hpp"
 #include "engine/renderer/Camera.hpp"
 #include "engine/renderer/IGraphicsDevice.hpp"
+#include "engine/replay/DemoRecorder.hpp"
 #include "engine/ui/HudAndConsole.hpp"
+#include "engine/weapons/BallisticsAndProjectiles.hpp"
 #include "engine/weapons/ViewModelRenderer.hpp"
 #include "engine/weapons/WeaponDef.hpp"
 #include "engine/weapons/WeaponSystem.hpp"
@@ -97,6 +101,21 @@ public:
     [[nodiscard]] ui::DiagnosticConsole& console() noexcept { return console_; }
     [[nodiscard]] const ui::DiagnosticConsole& console() const noexcept { return console_; }
     [[nodiscard]] input::InputManager& inputManager() noexcept { return inputManager_; }
+    [[nodiscard]] gameplay::MatchRulesEngine& matchRules() noexcept { return matchRules_; }
+    [[nodiscard]] const gameplay::MatchRulesEngine& matchRules() const noexcept {
+        return matchRules_;
+    }
+    [[nodiscard]] weapons::GrenadeSystem& grenadeSystem() noexcept { return grenadeSystem_; }
+    [[nodiscard]] const weapons::GrenadeSystem& grenadeSystem() const noexcept {
+        return grenadeSystem_;
+    }
+    [[nodiscard]] const ai::NavGraph& navGraph() const noexcept { return navGraph_; }
+    [[nodiscard]] ai::BotAgent& botAgent() noexcept { return botAgent_; }
+    [[nodiscard]] const ai::BotAgent& botAgent() const noexcept { return botAgent_; }
+    [[nodiscard]] replay::DemoRecorder& demoRecorder() noexcept { return demoRecorder_; }
+    [[nodiscard]] const replay::DemoRecorder& demoRecorder() const noexcept {
+        return demoRecorder_;
+    }
     [[nodiscard]] const renderer::RenderStats& lastRenderStats() const noexcept {
         return lastRenderStats_;
     }
@@ -119,6 +138,11 @@ private:
     weapons::WeaponLibrary weaponLibrary_;
     weapons::WeaponSystem weaponSystem_;
     weapons::ViewModelRenderer viewModelRenderer_;
+    weapons::GrenadeSystem grenadeSystem_;
+    gameplay::MatchRulesEngine matchRules_;
+    ai::NavGraph navGraph_;
+    ai::BotAgent botAgent_;
+    replay::DemoRecorder demoRecorder_;
     world::EntityManager entityManager_;
     audio::AudioEngine audioEngine_;
     networking::NetServer netServer_;

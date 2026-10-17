@@ -1,3 +1,4 @@
+#include "engine/ai/BotAI.hpp"
 #include "engine/animation/Skeleton.hpp"
 #include "engine/audio/AudioEngine.hpp"
 #include "engine/core/Clock.hpp"
@@ -9,6 +10,7 @@
 #include "engine/core/Version.hpp"
 #include "engine/debug/FrameStats.hpp"
 #include "engine/debug/Profiler.hpp"
+#include "engine/gameplay/MatchRules.hpp"
 #include "engine/input/InputManager.hpp"
 #include "engine/networking/NetSystem.hpp"
 #include "engine/physics/CollisionWorld.hpp"
@@ -18,8 +20,10 @@
 #include "engine/renderer/Shader.hpp"
 #include "engine/renderer/SoftwareGraphicsDevice.hpp"
 #include "engine/renderer/Texture.hpp"
+#include "engine/replay/DemoRecorder.hpp"
 #include "engine/resources/ModelLoader.hpp"
 #include "engine/ui/HudAndConsole.hpp"
+#include "engine/weapons/BallisticsAndProjectiles.hpp"
 #include "engine/weapons/ViewModelRenderer.hpp"
 #include "engine/weapons/WeaponDef.hpp"
 #include "engine/weapons/WeaponSystem.hpp"
@@ -62,12 +66,12 @@ bool testVersion() {
     using namespace classicfps::core;
     constexpr VersionInfo v = Version::current();
     EXPECT_TRUE(v.major == 1);
-    EXPECT_TRUE(v.minor == 0);
+    EXPECT_TRUE(v.minor == 2);
     EXPECT_TRUE(v.patch == 0);
     EXPECT_TRUE(v.isCompatibleWith(v));
 
     VersionInfo incompatible = v;
-    incompatible.minor = 1;
+    incompatible.minor = 99;
     EXPECT_TRUE(!v.isCompatibleWith(incompatible));
     EXPECT_TRUE(!Version::toString().empty());
     EXPECT_TRUE(!Version::buildBanner().empty());
@@ -1022,6 +1026,283 @@ bool testEngineLifecycle() {
     return true;
 }
 
+bool testMatchRules() {
+    using namespace classicfps::gameplay;
+
+    MatchRulesEngine match;
+    EXPECT_TRUE(match.roundNumber() == 1);
+    EXPECT_TRUE(match.phase() == RoundPhase::FreezeTime);
+
+    PlayerEconomyState ctPlayer{};
+    ctPlayer.team = TeamId::CounterTerrorists;
+    ctPlayer.cash = 800;
+    ctPlayer.inBuyZone = true;
+
+    // Can buy Kevlar ($650) and Defuse Kit ($200 -> needs more cash)
+    EXPECT_TRUE(match.purchaseItem(ctPlayer, "kevlar") == BuyResult::Success);
+    EXPECT_TRUE(ctPlayer.armor == 100);
+    EXPECT_TRUE(ctPlayer.cash == 150);
+    EXPECT_TRUE(match.purchaseItem(ctPlayer, "defuse_kit") == BuyResult::InsufficientFunds);
+
+    // Terrorist-restricted AK-47 cannot be bought by CT
+    ctPlayer.cash = 5000;
+    EXPECT_TRUE(match.purchaseItem(ctPlayer, "ak47") == BuyResult::WrongTeam);
+    EXPECT_TRUE(match.purchaseItem(ctPlayer, "m4a1") == BuyResult::Success);
+    EXPECT_TRUE(ctPlayer.primaryWeaponId == "m4a1");
+    EXPECT_TRUE(match.purchaseItem(ctPlayer, "defuse_kit") == BuyResult::Success);
+    EXPECT_TRUE(ctPlayer.hasDefuseKit);
+
+    // Upgrade full Kevlar to Kevlar+Helmet for $350
+    const int cashBeforeHelmet = ctPlayer.cash;
+    EXPECT_TRUE(match.purchaseItem(ctPlayer, "kevlar_helmet") == BuyResult::Success);
+    EXPECT_TRUE(ctPlayer.hasHelmet);
+    EXPECT_TRUE(ctPlayer.cash == cashBeforeHelmet - 350);
+
+    // Advance past freeze time (3.0s) into LiveRound
+    match.update(3.1f);
+    EXPECT_TRUE(match.phase() == RoundPhase::LiveRound);
+
+    // Plant C4 at bombsite (0, 0, -6) over 3.0 seconds
+    match.setBombsiteCenter(glm::vec3(0.0f, 0.0f, -6.0f), 3.5f);
+    EXPECT_TRUE(!match.beginOrUpdateBombPlant(glm::vec3(0.0f, 0.0f, -6.0f), true, 1.5f));
+    EXPECT_NEAR(match.plantProgressNormalized(), 0.5f, 1e-2f);
+    EXPECT_TRUE(match.beginOrUpdateBombPlant(glm::vec3(0.0f, 0.0f, -6.0f), true, 1.6f));
+    EXPECT_TRUE(match.isBombPlanted());
+    EXPECT_TRUE(match.phase() == RoundPhase::BombPlanted);
+
+    // Eliminating terrorists while bomb is planted does NOT end the round until defuse/explosion
+    match.onTeamEliminated(TeamId::Terrorists);
+    EXPECT_TRUE(match.phase() == RoundPhase::BombPlanted);
+
+    // Defuse C4 with kit (5.0 seconds)
+    EXPECT_TRUE(!match.beginOrUpdateBombDefuse(glm::vec3(0.0f, 0.0f, -6.0f), true, true, 2.5f));
+    EXPECT_NEAR(match.defuseProgressNormalized(true), 0.5f, 1e-2f);
+    EXPECT_TRUE(match.beginOrUpdateBombDefuse(glm::vec3(0.0f, 0.0f, -6.0f), true, true, 2.6f));
+    EXPECT_TRUE(match.phase() == RoundPhase::RoundEnd);
+    EXPECT_TRUE(match.lastWinningTeam() == TeamId::CounterTerrorists);
+    EXPECT_TRUE(match.lastWinReason() == RoundWinReason::BombDefused);
+    EXPECT_TRUE(match.ctScore() == 1);
+
+    // Verify C4 damage falloff curve
+    EXPECT_TRUE(match.computeC4ExplosionDamage(glm::vec3(0.0f, 0.0f, -6.0f)) > 450.0f);
+    EXPECT_TRUE(match.computeC4ExplosionDamage(glm::vec3(0.0f, 0.0f, 20.0f)) == 0.0f);
+    return true;
+}
+
+bool testBallisticsAndGrenades() {
+    using namespace classicfps::weapons;
+    using namespace classicfps::physics;
+
+    // 1. Multi-zone anatomical hitbox raycast (Head, Chest, Stomach, Legs)
+    const glm::vec3 targetFeet{0.0f, 0.0f, -5.0f};
+    const auto headHit = BallisticsCalculator::raycastCharacterHitboxes(
+        glm::vec3(0.0f, 1.62f, 0.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        20.0f,
+        targetFeet,
+        0.0f,
+        false);
+    EXPECT_TRUE(headHit.hit);
+    EXPECT_TRUE(headHit.hitgroup == Hitgroup::Head);
+
+    const auto stomachHit = BallisticsCalculator::raycastCharacterHitboxes(
+        glm::vec3(0.0f, 0.94f, 0.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        20.0f,
+        targetFeet,
+        0.0f,
+        false);
+    EXPECT_TRUE(stomachHit.hit);
+    EXPECT_TRUE(stomachHit.hitgroup == Hitgroup::Stomach);
+
+    const auto legHit = BallisticsCalculator::raycastCharacterHitboxes(
+        glm::vec3(-0.11f, 0.40f, 0.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        20.0f,
+        targetFeet,
+        0.0f,
+        false);
+    EXPECT_TRUE(legHit.hit);
+    EXPECT_TRUE(legHit.hitgroup == Hitgroup::LeftLeg);
+
+    // 2. Kevlar + Helmet damage math
+    const auto unarmoredHead = BallisticsCalculator::computeDamageWithArmor(
+        32.0f, 1.40f, Hitgroup::Head, 100, 100, false);
+    EXPECT_TRUE(unarmoredHead.healthDamage >= 120);
+    EXPECT_TRUE(unarmoredHead.fatal);
+
+    const auto helmetHead = BallisticsCalculator::computeDamageWithArmor(
+        32.0f, 1.40f, Hitgroup::Head, 100, 100, true);
+    EXPECT_TRUE(helmetHead.healthDamage < 100);
+    EXPECT_TRUE(!helmetHead.fatal);
+    EXPECT_TRUE(helmetHead.armorConsumed > 0);
+
+    // 3. Material penetration (Wallbanging) through a 0.4m wooden crate into a back wall
+    CollisionWorld world;
+    world.addBoxCollider("floor", glm::vec3(0.0f, -0.5f, 0.0f), glm::vec3(40.0f, 1.0f, 40.0f));
+    world.addBoxCollider("wood_crate", glm::vec3(0.0f, 1.0f, -3.0f), glm::vec3(1.0f, 2.0f, 0.40f));
+    world.addBoxCollider("back_wall", glm::vec3(0.0f, 1.0f, -8.0f), glm::vec3(4.0f, 4.0f, 1.0f));
+
+    const auto wb = BallisticsCalculator::tracePenetratingShot(
+        world,
+        glm::vec3(0.0f, 1.2f, 0.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        30.0f,
+        36.0f,
+        0.98f,
+        2);
+    EXPECT_TRUE(wb.hitAnySurface);
+    EXPECT_TRUE(wb.surfacesPenetrated == 1);
+    EXPECT_TRUE(wb.wallbangs.size() == 1);
+    EXPECT_NEAR(wb.wallbangs[0].thicknessMeters, 0.40f, 0.03f);
+    EXPECT_TRUE(wb.finalColliderTag == "back_wall");
+    EXPECT_TRUE(wb.finalDamage > 12.0f && wb.finalDamage < 36.0f);
+
+    // 4. Tactical Grenades: bounce, HE blast occlusion, Flashbang angle blindness, Smoke cloud LOS
+    GrenadeSystem grenades;
+    (void)grenades.throwGrenade(
+        GrenadeType::SmokeGrenade,
+        glm::vec3(0.0f, 1.2f, -1.0f),
+        glm::vec3(0.0f, 2.0f, -2.0f),
+        0.5f);
+    for (int i = 0; i < 60; ++i) {
+        grenades.update(world, 0.01f);
+    }
+    EXPECT_TRUE(grenades.activeGrenades().size() == 1);
+    EXPECT_TRUE(grenades.activeGrenades()[0].detonated);
+    EXPECT_TRUE(grenades.isLineOccludedBySmoke(
+        glm::vec3(0.0f, 1.0f, 2.0f),
+        glm::vec3(0.0f, 1.0f, -6.0f)));
+
+    // Flashbang direct look vs turned away in open line of sight (x = 4.0), and blocked behind crate (x = 0.0)
+    const float directFlash = GrenadeSystem::computeFlashBlindnessSeconds(
+        glm::vec3(4.0f, 1.5f, -5.0f),
+        glm::vec3(4.0f, 1.5f, 0.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        world);
+    const float turnedAwayFlash = GrenadeSystem::computeFlashBlindnessSeconds(
+        glm::vec3(4.0f, 1.5f, -5.0f),
+        glm::vec3(4.0f, 1.5f, 0.0f),
+        glm::vec3(0.0f, 0.0f, 1.0f),
+        world);
+    const float occludedByCrateFlash = GrenadeSystem::computeFlashBlindnessSeconds(
+        glm::vec3(0.0f, 1.5f, -5.0f),
+        glm::vec3(0.0f, 1.5f, 0.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        world);
+    EXPECT_TRUE(directFlash > 3.0f);
+    EXPECT_TRUE(turnedAwayFlash < directFlash * 0.3f);
+    EXPECT_NEAR(occludedByCrateFlash, 0.0f, 1e-5f);
+    return true;
+}
+
+bool testBotAI() {
+    using namespace classicfps::ai;
+    using namespace classicfps::physics;
+
+    CollisionWorld world;
+    world.addBoxCollider("floor", glm::vec3(0.0f, -0.5f, 0.0f), glm::vec3(40.0f, 1.0f, 40.0f));
+    world.addBoxCollider("center_wall", glm::vec3(0.0f, 1.5f, 0.0f), glm::vec3(5.0f, 3.0f, 1.0f));
+
+    NavGraph nav;
+    nav.buildDefaultArenaGraph(world);
+    EXPECT_TRUE(nav.nodes().size() >= 8);
+
+    const int startId = nav.findWaypointByTag(WaypointTag::SpawnCT);
+    const int goalId = nav.findWaypointByTag(WaypointTag::BombsiteA);
+    EXPECT_TRUE(startId > 0 && goalId > 0);
+
+    const auto path = nav.findPathAStar(startId, goalId);
+    EXPECT_TRUE(path.size() >= 3);
+
+    BotConfig cfg{};
+    cfg.name = "Bot_Tactical";
+    cfg.reactionTimeSeconds = 0.05f;
+    BotAgent bot(cfg);
+    bot.spawn(glm::vec3(-6.5f, 0.0f, 2.5f), -90.0f);
+
+    // Step bot without visible enemy -> patrols along A* path
+    for (int i = 0; i < 20; ++i) {
+        (void)bot.thinkAndStep(nav, world, nullptr, 0.01f);
+    }
+    EXPECT_TRUE(bot.state() == BotState::Patrol || bot.state() == BotState::MoveToObjective);
+
+    // Place enemy directly in front of bot's current facing direction in clear line of sight
+    const float yawRad = glm::radians(bot.controller().state().yawDegrees);
+    const glm::vec3 botForward{std::cos(yawRad), 0.0f, std::sin(yawRad)};
+    const glm::vec3 enemyEye = bot.controller().interpolatedEyePosition(1.0) + botForward * 4.0f;
+    bool firedAtEnemy = false;
+    for (int i = 0; i < 20; ++i) {
+        const auto cmd = bot.thinkAndStep(nav, world, &enemyEye, 0.01f);
+        if (cmd.fireHeld) {
+            firedAtEnemy = true;
+        }
+    }
+    EXPECT_TRUE(bot.state() == BotState::EngageEnemy);
+    EXPECT_TRUE(firedAtEnemy);
+
+    // Wound bot below 30 HP -> transitions to SeekCover
+    bot.applyDamage(80);
+    (void)bot.thinkAndStep(nav, world, &enemyEye, 0.01f);
+    EXPECT_TRUE(bot.state() == BotState::SeekCover);
+    return true;
+}
+
+bool testDemoReplay() {
+    using namespace classicfps::replay;
+    using namespace classicfps::physics;
+    using namespace classicfps::input;
+
+    CollisionWorld world;
+    world.addBoxCollider("floor", glm::vec3(0.0f, -0.5f, 0.0f), glm::vec3(40.0f, 1.0f, 40.0f));
+
+    FPSController liveController;
+    const glm::vec3 spawnPos{0.0f, 0.0f, 4.0f};
+    liveController.spawn(spawnPos, -90.0f, 0.0f);
+
+    DemoRecorder recorder;
+    recorder.beginRecording("de_arena", 100.0f, spawnPos, -90.0f, 0.0f);
+
+    for (std::uint32_t tick = 0; tick < 60; ++tick) {
+        PlayerCommand cmd{};
+        cmd.sequence = tick + 1;
+        cmd.forwardMove = 1.0f;
+        cmd.rightMove = (tick >= 30) ? 0.5f : 0.0f;
+        cmd.viewYawDegrees = -90.0f + static_cast<float>(tick) * 0.5f;
+        cmd.jump = (tick == 15);
+        cmd.fireJustPressed = (tick == 20);
+
+        liveController.simulateStep(cmd, world, 0.01f);
+        const std::uint32_t ev = cmd.fireJustPressed ? DemoEvent_FiredWeapon : DemoEvent_None;
+        recorder.recordTick(
+            cmd,
+            liveController.state().feetPosition,
+            liveController.state().velocity,
+            ev);
+    }
+    recorder.stopRecording();
+    EXPECT_TRUE(recorder.frames().size() == 60);
+
+    const std::filesystem::path demoPath =
+        std::filesystem::temp_directory_path() / "classicfps_test_match.cfdemo";
+    EXPECT_TRUE(recorder.saveToFile(demoPath.string()));
+
+    DemoPlayer player;
+    EXPECT_TRUE(player.loadFromFile(demoPath.string()));
+    std::filesystem::remove(demoPath);
+
+    EXPECT_TRUE(player.isLoaded());
+    EXPECT_TRUE(player.totalTicks() == 60);
+    EXPECT_TRUE(player.header().mapName == "de_arena");
+
+    // Verify 100% deterministic replay accuracy across all 60 ticks
+    const DeterminismReport report = player.verifyDeterminism(world, 1e-5f);
+    EXPECT_TRUE(report.deterministic);
+    EXPECT_TRUE(report.ticksVerified == 60);
+    EXPECT_NEAR(report.maxPositionErrorMeters, 0.0f, 1e-5f);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1053,6 +1334,10 @@ int main(int argc, char* argv[]) {
         {"hud_and_console", testHudAndConsole},
         {"networking_udp", testNetworkingUdp},
         {"engine_lifecycle", testEngineLifecycle},
+        {"match_rules", testMatchRules},
+        {"ballistics_and_grenades", testBallisticsAndGrenades},
+        {"bot_ai", testBotAI},
+        {"demo_replay", testDemoReplay},
     };
 
     std::string_view filter;

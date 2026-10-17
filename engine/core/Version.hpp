@@ -8,9 +8,9 @@ namespace classicfps::core {
 
 struct VersionInfo {
     std::uint32_t major{1};
-    std::uint32_t minor{0};
+    std::uint32_t minor{2};
     std::uint32_t patch{0};
-    std::string_view phase{"phase8-complete"};
+    std::string_view phase{"phase12-complete"};
     std::string_view engineName{"ClassicFPS Engine"};
     std::string_view platform{"Linux"};
 
