@@ -697,6 +697,32 @@ bool testGltfAndAnimation() {
     // Magazine bone should drop downward significantly during reload!
     EXPECT_TRUE(magReloadPos.y < magRestPos.y - 0.10f);
 
+    // Test 4-bone Linear Blend Skinning (LBS) on a vertex weighted 50% to bone 0 and 50% to bone 2
+    std::vector<classicfps::renderer::Vertex3D> bindVerts = {
+        {.position = glm::vec3(0.0f, 0.0f, 0.0f), .normal = glm::vec3(0.0f, 1.0f, 0.0f)}
+    };
+    std::vector<VertexSkinWeight> weights = {
+        {.jointIndices = {0, 2, 0, 0}, .jointWeights = glm::vec4(0.5f, 0.5f, 0.0f, 0.0f)}
+    };
+    std::vector<classicfps::renderer::Vertex3D> skinnedVerts;
+    Skeleton::applyLinearBlendSkinning(bindVerts, weights, player.skinMatrices(), skinnedVerts);
+    EXPECT_TRUE(skinnedVerts.size() == 1);
+    EXPECT_TRUE(skinnedVerts[0].position.y < -0.04f);
+
+    // Test AssetCache deduplication
+    classicfps::core::ResourceManager rm;
+    AssetCache cache(rm);
+    const std::filesystem::path tmpCacheFile =
+        std::filesystem::temp_directory_path() / "classicfps_cache_test.gltf";
+    EXPECT_TRUE(ModelLoader::saveGltf2ToFile(*carbine, tmpCacheFile.string()));
+    auto m1 = cache.loadOrGetGltfModel(tmpCacheFile.string());
+    auto m2 = cache.loadOrGetGltfModel(tmpCacheFile.string());
+    std::filesystem::remove(tmpCacheFile);
+    EXPECT_TRUE(m1 != nullptr && m1 == m2);
+    EXPECT_TRUE(cache.cacheMisses() == 1);
+    EXPECT_TRUE(cache.cacheHits() == 1);
+    rm.releaseAll();
+
     // Test Wavefront .obj parser
     const std::string sampleObj = R"(
         v -1.0 0.0 0.0
@@ -926,6 +952,25 @@ bool testNetworkingUdp() {
     // Client must detect the discrepancy and reconcile to the server's authoritative state near z = -3.0!
     EXPECT_TRUE(client.reconciliationCount() >= 1);
     EXPECT_TRUE(client.predictedController().state().feetPosition.z < -2.9f);
+
+    // Test SnapshotInterpolator for remote entities
+    SnapshotInterpolator interp;
+    interp.pushSnapshot(1.00, glm::vec3(0.0f, 0.0f, 0.0f), -90.0f, 0.0f);
+    interp.pushSnapshot(1.10, glm::vec3(10.0f, 0.0f, -4.0f), -50.0f, 10.0f);
+    const auto midPose = interp.sampleAt(1.05);
+    EXPECT_NEAR(midPose.feetPosition.x, 5.0f, 1e-3f);
+    EXPECT_NEAR(midPose.feetPosition.z, -2.0f, 1e-3f);
+    EXPECT_NEAR(midPose.yawDegrees, -70.0f, 1e-3f);
+
+    // Test Server-Side LagCompensator rewinding a moving target's hitbox
+    LagCompensator lagComp;
+    lagComp.recordPlayerState(1.00, 42, glm::vec3(0.0f, 0.0f, -5.0f));
+    lagComp.recordPlayerState(1.10, 42, glm::vec3(8.0f, 0.0f, -5.0f));
+    float hitDist = 0.0f;
+    // Ray aimed at x = 0, z = -5 should hit when rewound to t = 1.00, and miss at t = 1.10!
+    EXPECT_TRUE(lagComp.traceRewoundRay(1.00, 42, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 0.0f, -1.0f), 20.0f, hitDist));
+    EXPECT_NEAR(hitDist, 4.65f, 1e-2f);
+    EXPECT_TRUE(!lagComp.traceRewoundRay(1.10, 42, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 0.0f, -1.0f), 20.0f, hitDist));
 
     client.disconnect();
     server.stop();

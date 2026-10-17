@@ -650,4 +650,19 @@ std::shared_ptr<ArticulatedModel> ModelLoader::createTargetDummyModel() {
     return model;
 }
 
+std::shared_ptr<ArticulatedModel> AssetCache::loadOrGetGltfModel(const std::string& filePath) {
+    if (auto existing = resources_.findByName(filePath)) {
+        if (auto typed = std::dynamic_pointer_cast<ArticulatedModel>(existing)) {
+            ++cacheHits_;
+            return typed;
+        }
+    }
+    ++cacheMisses_;
+    auto loaded = ModelLoader::loadGltf2FromFile(filePath);
+    if (loaded) {
+        (void)resources_.registerResource(filePath, loaded);
+    }
+    return loaded;
+}
+
 } // namespace classicfps::resources

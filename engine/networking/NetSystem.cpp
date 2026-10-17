@@ -399,4 +399,124 @@ void NetClient::reconcileWithSnapshot(const ServerPlayerSnapshot& snap) {
     }
 }
 
+void SnapshotInterpolator::pushSnapshot(
+    double timestampSeconds,
+    const glm::vec3& feetPos,
+    float yawDeg,
+    float pitchDeg) {
+    buffer_.push_back(TimedPose{
+        .timestampSeconds = timestampSeconds,
+        .feetPosition = feetPos,
+        .yawDegrees = yawDeg,
+        .pitchDegrees = pitchDeg
+    });
+    if (buffer_.size() > 64) {
+        buffer_.erase(buffer_.begin());
+    }
+}
+
+SnapshotInterpolator::TimedPose SnapshotInterpolator::sampleAt(double renderTimestampSeconds) const noexcept {
+    if (buffer_.empty()) {
+        return TimedPose{};
+    }
+    if (buffer_.size() == 1 || renderTimestampSeconds <= buffer_.front().timestampSeconds) {
+        return buffer_.front();
+    }
+    if (renderTimestampSeconds >= buffer_.back().timestampSeconds) {
+        return buffer_.back();
+    }
+
+    for (std::size_t i = 0; i + 1 < buffer_.size(); ++i) {
+        const TimedPose& a = buffer_[i];
+        const TimedPose& b = buffer_[i + 1];
+        if (renderTimestampSeconds >= a.timestampSeconds &&
+            renderTimestampSeconds <= b.timestampSeconds) {
+            const double span = b.timestampSeconds - a.timestampSeconds;
+            const float alpha = (span > 1e-6)
+                ? static_cast<float>((renderTimestampSeconds - a.timestampSeconds) / span)
+                : 0.0f;
+            TimedPose out{};
+            out.timestampSeconds = renderTimestampSeconds;
+            out.feetPosition = glm::mix(a.feetPosition, b.feetPosition, alpha);
+            out.yawDegrees = a.yawDegrees + (b.yawDegrees - a.yawDegrees) * alpha;
+            out.pitchDegrees = a.pitchDegrees + (b.pitchDegrees - a.pitchDegrees) * alpha;
+            return out;
+        }
+    }
+    return buffer_.back();
+}
+
+void LagCompensator::recordPlayerState(
+    double serverTimeSeconds,
+    std::uint32_t playerId,
+    const glm::vec3& feetPosition,
+    float height) {
+    history_.push_back(HistoricalHitbox{
+        .serverTimeSeconds = serverTimeSeconds,
+        .playerId = playerId,
+        .center = feetPosition + glm::vec3(0.0f, height * 0.5f, 0.0f),
+        .halfExtents = glm::vec3(0.35f, height * 0.5f, 0.35f)
+    });
+    if (history_.size() > 256) {
+        history_.erase(history_.begin());
+    }
+}
+
+bool LagCompensator::traceRewoundRay(
+    double targetTimeSeconds,
+    std::uint32_t targetPlayerId,
+    const glm::vec3& rayOrigin,
+    const glm::vec3& rayDir,
+    float maxRange,
+    float& outHitDistance) const noexcept {
+    const HistoricalHitbox* best = nullptr;
+    double bestTimeDiff = 1e9;
+
+    for (const auto& h : history_) {
+        if (h.playerId != targetPlayerId) {
+            continue;
+        }
+        const double diff = std::abs(h.serverTimeSeconds - targetTimeSeconds);
+        if (diff < bestTimeDiff) {
+            bestTimeDiff = diff;
+            best = &h;
+        }
+    }
+
+    if (best == nullptr) {
+        return false;
+    }
+
+    // Ray vs AABB slab test on rewound hitbox
+    const glm::vec3 bMin = best->center - best->halfExtents;
+    const glm::vec3 bMax = best->center + best->halfExtents;
+    float tMin = 0.0f;
+    float tMax = maxRange;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const float o = rayOrigin[axis];
+        const float d = rayDir[axis];
+        if (std::abs(d) < 1e-6f) {
+            if (o < bMin[axis] || o > bMax[axis]) {
+                return false;
+            }
+        } else {
+            const float invD = 1.0f / d;
+            float t1 = (bMin[axis] - o) * invD;
+            float t2 = (bMax[axis] - o) * invD;
+            if (t1 > t2) {
+                std::swap(t1, t2);
+            }
+            if (t1 > tMin) tMin = t1;
+            if (t2 < tMax) tMax = t2;
+            if (tMin > tMax) {
+                return false;
+            }
+        }
+    }
+
+    outHitDistance = tMin;
+    return (tMin >= 0.0f && tMin <= maxRange);
+}
+
 } // namespace classicfps::networking

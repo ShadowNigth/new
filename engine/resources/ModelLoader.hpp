@@ -54,4 +54,21 @@ public:
     [[nodiscard]] static std::shared_ptr<ArticulatedModel> createTargetDummyModel();
 };
 
+// Deduplicating asset loader & cache backed by ResourceManager
+class AssetCache {
+public:
+    explicit AssetCache(core::ResourceManager& resourceManager) noexcept
+        : resources_(resourceManager) {}
+
+    [[nodiscard]] std::shared_ptr<ArticulatedModel> loadOrGetGltfModel(const std::string& filePath);
+
+    [[nodiscard]] std::uint64_t cacheHits() const noexcept { return cacheHits_; }
+    [[nodiscard]] std::uint64_t cacheMisses() const noexcept { return cacheMisses_; }
+
+private:
+    core::ResourceManager& resources_;
+    std::uint64_t cacheHits_{0};
+    std::uint64_t cacheMisses_{0};
+};
+
 } // namespace classicfps::resources

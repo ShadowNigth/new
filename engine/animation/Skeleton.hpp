@@ -1,5 +1,8 @@
 #pragma once
 
+#include "engine/renderer/Mesh.hpp"
+
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <glm/glm.hpp>
@@ -9,6 +12,12 @@
 #include <vector>
 
 namespace classicfps::animation {
+
+// Up to 4 bone influences per vertex for Linear Blend Skinning (LBS)
+struct VertexSkinWeight {
+    std::array<std::uint16_t, 4> jointIndices{0, 0, 0, 0};
+    glm::vec4 jointWeights{1.0f, 0.0f, 0.0f, 0.0f};
+};
 
 struct TransformTRS {
     glm::vec3 translation{0.0f, 0.0f, 0.0f};
@@ -77,6 +86,13 @@ public:
         const std::vector<TransformTRS>& localPose,
         std::vector<glm::mat4>& outGlobalMatrices,
         std::vector<glm::mat4>& outSkinMatrices) const noexcept;
+
+    // Deforms bind-pose vertices and normals using 4-bone Linear Blend Skinning (LBS)
+    static void applyLinearBlendSkinning(
+        const std::vector<renderer::Vertex3D>& bindVertices,
+        const std::vector<VertexSkinWeight>& skinWeights,
+        const std::vector<glm::mat4>& skinMatrices,
+        std::vector<renderer::Vertex3D>& outSkinnedVertices) noexcept;
 
 private:
     std::vector<Bone> bones_;

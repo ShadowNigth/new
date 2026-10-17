@@ -32,6 +32,8 @@ struct NetPacketHeader {
     std::uint16_t version{kNetProtocolVersion};
     std::uint8_t type{0};
     std::uint32_t sequence{0};
+    std::uint32_t ackSequence{0};
+    std::uint32_t ackBitfield{0}; // 32-bit sliding window of prior received packets
 };
 
 struct ClientUserCmdPayload {
@@ -172,6 +174,53 @@ private:
     std::vector<PredictedStep> predictionHistory_;
     std::uint32_t reconciliationCount_{0};
     std::uint32_t snapshotsReceived_{0};
+};
+
+// Smoothly interpolates remote player positions between received server snapshots
+class SnapshotInterpolator {
+public:
+    struct TimedPose {
+        double timestampSeconds{0.0};
+        glm::vec3 feetPosition{0.0f};
+        float yawDegrees{-90.0f};
+        float pitchDegrees{0.0f};
+    };
+
+    void pushSnapshot(double timestampSeconds, const glm::vec3& feetPos, float yawDeg, float pitchDeg);
+    [[nodiscard]] TimedPose sampleAt(double renderTimestampSeconds) const noexcept;
+    [[nodiscard]] std::size_t bufferedCount() const noexcept { return buffer_.size(); }
+
+private:
+    std::vector<TimedPose> buffer_;
+};
+
+// Server-side lag compensation history buffer for rewinding hitboxes during hitscan verification
+class LagCompensator {
+public:
+    struct HistoricalHitbox {
+        double serverTimeSeconds{0.0};
+        std::uint32_t playerId{0};
+        glm::vec3 center{0.0f};
+        glm::vec3 halfExtents{0.35f, 0.90f, 0.35f};
+    };
+
+    void recordPlayerState(
+        double serverTimeSeconds,
+        std::uint32_t playerId,
+        const glm::vec3& feetPosition,
+        float height = 1.80f);
+
+    // Rewinds to targetTimeSeconds (e.g. serverTime - rtt/2) and tests ray intersection
+    [[nodiscard]] bool traceRewoundRay(
+        double targetTimeSeconds,
+        std::uint32_t targetPlayerId,
+        const glm::vec3& rayOrigin,
+        const glm::vec3& rayDir,
+        float maxRange,
+        float& outHitDistance) const noexcept;
+
+private:
+    std::vector<HistoricalHitbox> history_;
 };
 
 } // namespace classicfps::networking

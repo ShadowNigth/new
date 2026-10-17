@@ -146,6 +146,55 @@ void Skeleton::computeGlobalAndSkinMatrices(
     }
 }
 
+void Skeleton::applyLinearBlendSkinning(
+    const std::vector<renderer::Vertex3D>& bindVertices,
+    const std::vector<VertexSkinWeight>& skinWeights,
+    const std::vector<glm::mat4>& skinMatrices,
+    std::vector<renderer::Vertex3D>& outSkinnedVertices) noexcept {
+    outSkinnedVertices.resize(bindVertices.size());
+    if (skinMatrices.empty()) {
+        outSkinnedVertices = bindVertices;
+        return;
+    }
+
+    for (std::size_t v = 0; v < bindVertices.size(); ++v) {
+        const renderer::Vertex3D& src = bindVertices[v];
+        renderer::Vertex3D dst = src;
+
+        if (v < skinWeights.size()) {
+            const VertexSkinWeight& sw = skinWeights[v];
+            glm::vec4 blendedPos(0.0f);
+            glm::vec3 blendedNorm(0.0f);
+            float totalWeight = 0.0f;
+
+            for (std::size_t k = 0; k < 4; ++k) {
+                const float w = sw.jointWeights[static_cast<glm::vec4::length_type>(k)];
+                if (w <= 1e-5f) {
+                    continue;
+                }
+                const std::uint16_t jIdx = sw.jointIndices[k];
+                const glm::mat4& mat = (jIdx < skinMatrices.size())
+                    ? skinMatrices[jIdx]
+                    : glm::mat4(1.0f);
+
+                blendedPos += (mat * glm::vec4(src.position, 1.0f)) * w;
+                blendedNorm += (glm::mat3(mat) * src.normal) * w;
+                totalWeight += w;
+            }
+
+            if (totalWeight > 1e-5f) {
+                dst.position = glm::vec3(blendedPos);
+                const float nLen = glm::length(blendedNorm);
+                if (nLen > 1e-5f) {
+                    dst.normal = blendedNorm / nLen;
+                }
+            }
+        }
+
+        outSkinnedVertices[v] = dst;
+    }
+}
+
 AnimationPlayer::AnimationPlayer(const Skeleton* skeleton) noexcept {
     setSkeleton(skeleton);
 }
