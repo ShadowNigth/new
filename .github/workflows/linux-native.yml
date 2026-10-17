@@ -1,0 +1,59 @@
+name: Native Linux port
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-native:
+    name: Native Linux runtime test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config git \
+            libsdl2-dev libepoxy-dev libssl-dev python3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.98.1
+          target: x86_64-unknown-linux-gnu
+      - name: Prepare pinned runtime with all patches
+        run: |
+          set -euo pipefail
+          mkdir -p third_party .work
+          git clone https://github.com/sp00nznet/xboxrecomp.git third_party/xboxrecomp
+          git -C third_party/xboxrecomp checkout --detach 766ecefcd7fb2a9b344de8ec891f6fe9ea14261b
+          for patch in xboxrecomp.patch xboxrecomp-clang.patch xboxrecomp-linux.patch; do
+            git -C third_party/xboxrecomp apply --check "$PWD/patches/$patch"
+            git -C third_party/xboxrecomp apply "$PWD/patches/$patch"
+          done
+          git clone --depth 1 --branch v1.0.0 https://github.com/mborgerson/dsp56300.git .work/err009-dsp56300
+          test "$(git -C .work/err009-dsp56300 rev-parse HEAD)" = aab3649fc452daf03da8b5e36fdc0c308d874101
+      - name: Build and run the native runtime test
+        run: |
+          set -euo pipefail
+          cmake -S tests/linux_native -B build-linux-native-test -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux-native-test --parallel 2
+          ctest --test-dir build-linux-native-test --output-on-failure
+      - name: Syntax-check the game sources against the patched runtime
+        run: |
+          set -euo pipefail
+          # Generated headers come from the retail XBE, so stand in the
+          # runtime's own template and an empty generated IDCT body.
+          mkdir -p /tmp/genstub/recomp/gen
+          cp third_party/xboxrecomp/templates/runtime/recomp_types.h /tmp/genstub/recomp/gen/
+          echo '/* generated in real builds */' > /tmp/genstub/black_xmv_idct.inc
+          RT="$PWD/third_party/xboxrecomp"
+          INCLUDES="-I/tmp/genstub -Isrc -I$RT/include -I$RT/src -I$RT/src/platform
+            -I$RT/src/kernel -I$RT/src/video -I$RT/src/input -I$RT/src/d3d
+            -I$RT/src/audio -I$RT/src/apu -I$RT/src/nv2a -I$RT/src/usb
+            -I$PWD/.work/err009-dsp56300/crates/emu-ffi/include
+            $(pkg-config --cflags sdl2 epoxy)"
+          cc -fsyntax-only -std=gnu11 -mavx2 $INCLUDES src/main.c
+          cc -fsyntax-only -std=gnu11 -mavx2 $INCLUDES src/recomp_manual.c
