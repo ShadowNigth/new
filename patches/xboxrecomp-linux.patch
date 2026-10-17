@@ -1,0 +1,1625 @@
+diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
+index 8756189..6b818f9 100644
+--- a/src/apu/apu_mmio_hook.c
++++ b/src/apu/apu_mmio_hook.c
+@@ -15,11 +15,17 @@
+  * platform's MMIO hook is active, so define it before the #if guard. */
+ MCPXAPUState *g_apu_state = NULL;
+ 
+-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
+- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
+- * now the whole body is Windows-only so apu_emu links on Debian. */
++/* The MMIO hook is a VEH x86-64 instruction decoder. On Windows the VEH
++ * supplies the CONTEXT; on Linux the sigaction-based VEH in win32_compat.c
++ * fills the same CONTEXT layout from ucontext_t, so the decoder body --
++ * register access through CONTEXT fields, Rip advance on success -- is
++ * shared verbatim. */
+ #if defined(_WIN32)
+ #include <windows.h>
++#elif defined(__linux__)
++#include "../platform/win32_compat.h"
++#endif
++#if defined(_WIN32) || defined(__linux__)
+ 
+ /* APU MMIO base in Xbox VA space */
+ #define APU_MMIO_BASE  0xFE800000u
+@@ -280,4 +286,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+     return ok;
+ }
+ 
+-#endif /* _WIN32 */
++#endif /* _WIN32 || __linux__ */
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index e139d2e..cbbdc01 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -366,13 +366,143 @@ void xa2_get_output_stats(Xa2OutputStats *stats)
+     }
+ }
+ 
+-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+-
+-int  xa2_init(void)                                   { return 0; }
+-void xa2_shutdown(void)                               {}
+-int  xa2_is_active(void)                              { return 0; }
+-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
+-int  xa2_get_buffer_size(void)                        { return 0; }
+-void xa2_get_output_stats(Xa2OutputStats *s)           { memset(s, 0, sizeof(*s)); }
++#else /* !_WIN32 -- SDL2 audio output, same contract as the XAudio2 graph */
++
++/* Mirrored semantics: 48 kHz stereo s16, three 1024-frame packets, playback
++ * starts once two packets are queued (and re-primes the same way after an
++ * underrun), a full queue is BACKPRESSURE rather than a dropped packet, and
++ * the stats block reports submitted/played in per-channel samples. */
++#include <SDL.h>
++
++#define XA2_SAMPLE_RATE   48000
++#define XA2_CHANNELS      2
++#define XA2_BUF_SAMPLES   1024
++#define XA2_NUM_BUFS      3
++
++static SDL_AudioDeviceID g_sdl_audio;
++static SDL_AudioStream  *g_sdl_stream;   /* only when the device format differs */
++static int               g_sdl_started;
++static uint64_t          g_sdl_submitted; /* per-channel samples accepted */
++static Xa2OutputStats    g_sdl_stats;
++
++int xa2_init(void)
++{
++    SDL_AudioSpec want, have;
++
++    if (g_sdl_audio)
++        return 1;
++    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
++        fprintf(stderr, "[AUDIO] SDL audio init failed: %s\n", SDL_GetError());
++        return 0;
++    }
++    memset(&want, 0, sizeof(want));
++    want.freq = XA2_SAMPLE_RATE;
++    want.format = AUDIO_S16LSB;
++    want.channels = XA2_CHANNELS;
++    want.samples = XA2_BUF_SAMPLES;
++    g_sdl_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have,
++                                      SDL_AUDIO_ALLOW_FREQUENCY_CHANGE |
++                                      SDL_AUDIO_ALLOW_FORMAT_CHANGE);
++    if (!g_sdl_audio) {
++        fprintf(stderr, "[AUDIO] no output device: %s\n", SDL_GetError());
++        return 0;
++    }
++    if (have.freq != want.freq || have.format != want.format ||
++        have.channels != want.channels) {
++        g_sdl_stream = SDL_NewAudioStream(want.format, want.channels, want.freq,
++                                          have.format, have.channels, have.freq);
++        if (!g_sdl_stream) {
++            fprintf(stderr, "[AUDIO] stream create failed: %s\n", SDL_GetError());
++            SDL_CloseAudioDevice(g_sdl_audio);
++            g_sdl_audio = 0;
++            return 0;
++        }
++    }
++    memset(&g_sdl_stats, 0, sizeof(g_sdl_stats));
++    g_sdl_submitted = 0;
++    g_sdl_started = 0;
++    fprintf(stderr, "[AUDIO] SDL output %d Hz %s (%d x %d-sample buffers)\n",
++            have.freq, g_sdl_stream ? "with conversion" : "direct",
++            XA2_NUM_BUFS, XA2_BUF_SAMPLES);
++    return 1;
++}
++
++void xa2_shutdown(void)
++{
++    if (g_sdl_stream) { SDL_FreeAudioStream(g_sdl_stream); g_sdl_stream = NULL; }
++    if (g_sdl_audio) { SDL_CloseAudioDevice(g_sdl_audio); g_sdl_audio = 0; }
++    g_sdl_started = 0;
++}
++
++int xa2_is_active(void) { return g_sdl_audio != 0; }
++
++static uint32_t sdl_queued_frames(void)
++{
++    Uint32 bytes = SDL_GetQueuedAudioSize(g_sdl_audio);
++    if (g_sdl_stream)
++        bytes += (Uint32)SDL_AudioStreamAvailable(g_sdl_stream);
++    return bytes / (XA2_CHANNELS * sizeof(int16_t));
++}
++
++int xa2_submit_samples(const int16_t *samples, int num_samples)
++{
++    int copy_samples;
++
++    if (!g_sdl_audio || !samples || num_samples <= 0)
++        return XA2_SUBMIT_ERROR;
++    copy_samples = num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples;
++
++    if (!g_sdl_started && sdl_queued_frames() == 0 && g_sdl_submitted) {
++        /* Underrun: the queue drained dry; re-prime before restarting. */
++        ++g_sdl_stats.reprimes;
++    }
++    if (sdl_queued_frames() >= (uint32_t)(XA2_NUM_BUFS * XA2_BUF_SAMPLES)) {
++        ++g_sdl_stats.queue_full;
++        return XA2_SUBMIT_BACKPRESSURE;
++    }
++    if (g_sdl_stream) {
++        if (SDL_AudioStreamPut(g_sdl_stream, samples,
++                copy_samples * XA2_CHANNELS * (int)sizeof(int16_t)) < 0 ||
++            SDL_AudioStreamFlush(g_sdl_stream) < 0) {
++            ++g_sdl_stats.submit_failed;
++            return XA2_SUBMIT_ERROR;
++        }
++        for (;;) {
++            uint8_t buf[XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t) * 2];
++            int got = SDL_AudioStreamGet(g_sdl_stream, buf, (int)sizeof(buf));
++            if (got < 0) { ++g_sdl_stats.submit_failed; return XA2_SUBMIT_ERROR; }
++            if (got == 0) break;
++            if (SDL_QueueAudio(g_sdl_audio, buf, (Uint32)got) < 0) {
++                ++g_sdl_stats.submit_failed;
++                return XA2_SUBMIT_ERROR;
++            }
++        }
++    } else if (SDL_QueueAudio(g_sdl_audio, samples,
++                 (Uint32)(copy_samples * XA2_CHANNELS * sizeof(int16_t))) < 0) {
++        ++g_sdl_stats.submit_failed;
++        return XA2_SUBMIT_ERROR;
++    }
++    g_sdl_submitted += (uint64_t)copy_samples;
++    g_sdl_stats.submitted_samples += (uint64_t)copy_samples;
++    /* Prime two packets before starting, like the XAudio2 path. */
++    if (!g_sdl_started &&
++        sdl_queued_frames() >= (uint32_t)(2 * XA2_BUF_SAMPLES)) {
++        SDL_PauseAudioDevice(g_sdl_audio, 0);
++        g_sdl_started = 1;
++    }
++    return XA2_SUBMIT_ACCEPTED;
++}
++
++int xa2_get_buffer_size(void) { return XA2_BUF_SAMPLES; }
++
++void xa2_get_output_stats(Xa2OutputStats *stats)
++{
++    uint32_t queued = g_sdl_audio ? sdl_queued_frames() : 0;
++    *stats = g_sdl_stats;
++    stats->queued_buffers = queued / XA2_BUF_SAMPLES;
++    stats->played_samples = g_sdl_submitted > queued ? g_sdl_submitted - queued : 0;
++    if (g_sdl_audio && !g_sdl_started && queued == 0 && g_sdl_submitted)
++        stats->empty_queue = 1;
++}
+ 
+ #endif /* _WIN32 */
+diff --git a/src/input/pc_input.c b/src/input/pc_input.c
+index 11631b9..7837301 100644
+--- a/src/input/pc_input.c
++++ b/src/input/pc_input.c
+@@ -20,7 +20,15 @@
+ #if defined(_WIN32)
+ #include <windows.h>
+ #else
+-#error "pc_input is Windows only (raw input, scancodes)"
++/* The event core is platform-neutral: key ids are PS/2 set-1 scancodes
++ * (extended keys get bit 0x100), and every host event arrives through the
++ * pc_input_*_event() functions below. Windows feeds them from raw input in
++ * the presenter; on Linux the SDL presenter translates SDL scancodes to
++ * set-1 and feeds the same functions. Only the threading/time primitives
++ * come from the host layer. */
++#include "../platform/win32_compat.h"
++#include <strings.h>
++#define _stricmp strcasecmp
+ #endif
+ 
+ /* ---- constants ----------------------------------------------------------------------------- */
+@@ -1254,12 +1262,16 @@ static const char *src_label(unsigned id, char *buf, size_t cap)
+     if (!k) { snprintf(buf, cap, "KEY %02X", id & 0xFF); return buf; }
+     if (s_layout_labels && id < 0x100 && (isalpha((unsigned char)k->name[0]) || isdigit((unsigned char)k->name[0])) && !k->name[1]) {
+         /* the letter printed on that physical key in the player's layout, when it is plain ASCII */
++#if defined(_WIN32)
+         UINT vk = MapVirtualKeyW(id & 0xFF, MAPVK_VSC_TO_VK_EX);
+         UINT ch = vk ? MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) : 0;
+         if (!(ch & 0x80000000u) && ch >= 0x20 && ch < 0x7F) {
+             buf[0] = (char)toupper((int)ch); buf[1] = 0;
+             return buf;
+         }
++#endif
++        /* Off Windows there is no layout lookup behind the presenter, so the
++         * printed label stays the QWERTY position name (physical keys). */
+     }
+     snprintf(buf, cap, "%s", k->label);
+     return buf;
+diff --git a/src/kernel/thread_placement.c b/src/kernel/thread_placement.c
+index 5532be8..b7aa387 100644
+--- a/src/kernel/thread_placement.c
++++ b/src/kernel/thread_placement.c
+@@ -15,11 +15,70 @@
+  * hardware threads stay in the mask, so the thread may move between them but nothing else is put on that core on
+  * purpose), and the polling roles take the efficiency cores.
+  */
++#if defined(_WIN32)
+ #include <windows.h>
++#elif defined(__linux__)
++#define _GNU_SOURCE
++#include <pthread.h>
++#include <sched.h>
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#if defined(__linux__)
++/* Linux: explicit RECOMP_PIN_<ROLE>=<hex mask> pins through
++ * sched_setaffinity (bit i = logical CPU i, up to 1024 CPUs). Automatic
++ * hybrid placement has no portable efficiency-class source here, so
++ * automatic mode leaves placement to the scheduler; explicit masks -- the
++ * override that exists for debugging -- work exactly as on Windows. */
++void xbox_PinThread(const char *role)
++{
++    char name[48];
++    const char *e;
++    static int s_mode = -1;
++    cpu_set_t set;
++    int cpu;
++
++    if (s_mode < 0) {
++        const char *m = getenv("RECOMP_THREAD_PLACEMENT");
++        s_mode = !(m && *m == '0');
++    }
++    if (!s_mode || !role)
++        return;
++    snprintf(name, sizeof(name), "RECOMP_PIN_%s", role);
++    e = getenv(name);
++    if (!e || !*e)
++        return;
++    CPU_ZERO(&set);
++    {
++        /* Parse from the least significant hex digit: digit k covers
++         * CPUs 4k..4k+3, which keeps masks wider than 64 CPUs usable. */
++        size_t len = strlen(e), i;
++        if (len > 2 && e[0] == '0' && (e[1] == 'x' || e[1] == 'X')) { e += 2; len -= 2; }
++        for (i = 0; i < len; i++) {
++            char c = e[len - 1 - i];
++            unsigned v = (c >= '0' && c <= '9') ? (unsigned)(c - '0')
++                       : (c >= 'a' && c <= 'f') ? (unsigned)(c - 'a' + 10)
++                       : (c >= 'A' && c <= 'F') ? (unsigned)(c - 'A' + 10) : 0;
++            int bit;
++            for (bit = 0; bit < 4; bit++)
++                if (v & (1u << bit)) {
++                    size_t which = i * 4 + (size_t)bit;
++                    if (which < CPU_SETSIZE) CPU_SET(which, &set);
++                }
++        }
++    }
++    for (cpu = 0; cpu < CPU_SETSIZE; cpu++)
++        if (CPU_ISSET(cpu, &set))
++            break;
++    if (cpu == CPU_SETSIZE)
++        return;
++    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0)
++        fprintf(stderr, "[THREAD] %s pinned by %s\n", role, name);
++}
++#else
++
+ typedef struct PCore { KAFFINITY mask; BYTE eff; } PCore;
+ 
+ static PCore s_core[128];
+@@ -119,3 +178,4 @@ void xbox_PinThread(const char *role)
+         }
+     }
+ }
++#endif /* _WIN32 / __linux__ */
+diff --git a/src/nv2a/kelvin/kelvin_gpu.c b/src/nv2a/kelvin/kelvin_gpu.c
+index d7ceca6..b61c091 100644
+--- a/src/nv2a/kelvin/kelvin_gpu.c
++++ b/src/nv2a/kelvin/kelvin_gpu.c
+@@ -4,6 +4,67 @@
+  * Pixel semantics follow kelvin_pixel.c (the CPU reference); the shader that
+  * evaluates them is kelvin_gpu_hlsl.inc.
+  */
++#if !defined(_WIN32)
++/* The GPU backend is D3D11-only. Off Windows the Kelvin CPU renderer is the
++ * renderer (it is also the semantic reference for the GPU path), so every
++ * entry point reports "not enabled / not active" and draws nothing; callers
++ * already keep the CPU renderer whenever kgpu_active() is false. */
++#include "kelvin_gpu.h"
++#include <stdio.h>
++#include <string.h>
++
++long long g_kgpu_ticks[KGP_COUNT];
++volatile uint32_t g_black_main_tid;
++void kgpu_symbol_name(uint64_t addr, char *out, size_t cap)
++{
++    /* dladdr naming lives in the D3D11 backend's crash reports; the CPU
++     * renderer has no GPU-thread symbols to name. */
++    if (out && cap) snprintf(out, cap, "0x%llX", (unsigned long long)addr);
++}
++
++bool kgpu_enabled(void) { return false; }
++bool kgpu_active(void) { return false; }
++bool kgpu_init(void) { return false; }
++void kgpu_report(void) {}
++void kgpu_note_kick(void) {}
++void kgpu_host_size(unsigned int *w, unsigned int *h)
++{
++    /* The CPU renderer's raster size, as pc_video reports it on Windows. */
++    extern void pc_video_render_size(unsigned int *, unsigned int *);
++    pc_video_render_size(w, h);
++}
++bool kgpu_vs_enabled(void) { return false; }
++bool kgpu_vs_ready(const void *program, uint32_t hash, uint32_t start)
++{ (void)program; (void)hash; (void)start; return false; }
++void kgpu_draw(const KGpuDraw *d) { (void)d; }
++void kgpu_clear(const KelvinTarget *t, bool color, bool depth, bool stencil,
++                uint32_t color_value, uint32_t zs_value, unsigned int channel_mask,
++                int x0, int y0, int x1, int y1, unsigned int color_format)
++{
++    (void)t; (void)color; (void)depth; (void)stencil; (void)color_value;
++    (void)zs_value; (void)channel_mask; (void)x0; (void)y0; (void)x1; (void)y1;
++    (void)color_format;
++}
++void kgpu_set_viewmodel(const uint32_t *vs_hashes, int count, float scale)
++{ (void)vs_hashes; (void)count; (void)scale; }
++void kgpu_set_ao_camera(float half_x, float half_y) { (void)half_x; (void)half_y; }
++bool kgpu_compare_enabled(void) { return false; }
++void kgpu_compare_frame(const KelvinTarget *t, unsigned int color_format)
++{ (void)t; (void)color_format; }
++void kgpu_pass_check(void) {}
++bool kgpu_async_active(void) { return false; }
++void kgpu_drain(void) {}
++void kgpu_defer_call(void (*fn)(uintptr_t, uintptr_t), uintptr_t a, uintptr_t b)
++{
++    /* No GPU thread: run deferred work inline, as synchronous submission does. */
++    if (fn) fn(a, b);
++}
++uint32_t kgpu_get_bound(uint32_t get) { return get; }
++void kgpu_flip(const KelvinTarget *t, unsigned int color_format,
++               uint32_t aspect_w, uint32_t aspect_h)
++{ (void)t; (void)color_format; (void)aspect_w; (void)aspect_h; }
++
++#else /* _WIN32 */
+ #define COBJMACROS
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+@@ -2212,3 +2273,5 @@ void kgpu_profile_maybe_start(void)
+ }
+ 
+ #include "kelvin_gpu_async.inc"
++
++#endif /* _WIN32 (Kelvin D3D11 backend) */
+diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
+index d2b401d..88b6f49 100644
+--- a/src/nv2a/nv2a_mmio_hook.c
++++ b/src/nv2a/nv2a_mmio_hook.c
+@@ -28,7 +28,12 @@ static int g_mmio_decode_fail = 0;
+  * (regardless of whether the MMIO hook is active). Keep its definition
+  * outside the Win32 guard. */
+ 
+-#if defined(_WIN32)
++#if !defined(_WIN32) && defined(__linux__)
++/* CONTEXT + VirtualAlloc come from the POSIX Win32 primitive layer; the
++ * VEH that fills the CONTEXT from ucontext_t lives there too. */
++#include "../platform/win32_compat.h"
++#endif
++#if defined(_WIN32) || defined(__linux__)
+ 
+ /* ============================================================
+  * x86-64 register access helpers
+@@ -417,7 +422,7 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
+     return false;
+ }
+ 
+-#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
++#else /* neither Win32 nor Linux: no VEH, so MMIO accesses cannot be trapped */
+ 
+ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
+ { (void)xbox_mem_offset; }
+diff --git a/src/platform/intrin.h b/src/platform/intrin.h
+new file mode 100644
+index 0000000..eaa7b74
+--- /dev/null
++++ b/src/platform/intrin.h
+@@ -0,0 +1,64 @@
++/*
++ * intrin.h - POSIX shim for the MSVC intrinsics the renderer uses.
++ * Linux-only in practice: see windows.h in this directory for why this
++ * include path cannot shadow the real MSVC header on Windows.
++ */
++#ifndef PLATFORM_INTRIN_SHIM_H
++#define PLATFORM_INTRIN_SHIM_H
++
++#if !defined(_WIN32)
++
++#include "win32_compat.h"
++#include <immintrin.h>
++#include <stdint.h>
++
++#ifndef __int64
++#define __int64 long long
++#endif
++#ifndef __forceinline
++#define __forceinline inline __attribute__((always_inline))
++#endif
++
++#define _InterlockedExchangeAdd64   InterlockedExchangeAdd64
++#define _InterlockedExchange64      InterlockedExchange64
++#define _InterlockedIncrement64     InterlockedIncrement64
++#define _InterlockedDecrement64     InterlockedDecrement64
++#define _InterlockedCompareExchange64 InterlockedCompareExchange64
++#define _InterlockedExchangeAdd     InterlockedExchangeAdd
++#define _InterlockedExchange        InterlockedExchange
++#define _InterlockedIncrement       InterlockedIncrement
++#define _InterlockedDecrement       InterlockedDecrement
++#define _InterlockedCompareExchange InterlockedCompareExchange
++#define _InterlockedOr              InterlockedOr
++#define _InterlockedAnd             InterlockedAnd
++
++static inline unsigned char _BitScanForward(unsigned long *index, unsigned long mask)
++{
++    if (!mask) return 0;
++    *index = (unsigned long)__builtin_ctzl(mask);
++    return 1;
++}
++static inline unsigned char _BitScanReverse(unsigned long *index, unsigned long mask)
++{
++    if (!mask) return 0;
++    *index = 63ul - (unsigned long)__builtin_clzl(mask);
++    return 1;
++}
++static inline unsigned char _BitScanForward64(unsigned long *index, unsigned long long mask)
++{
++    if (!mask) return 0;
++    *index = (unsigned long)__builtin_ctzll(mask);
++    return 1;
++}
++static inline unsigned char _BitScanReverse64(unsigned long *index, unsigned long long mask)
++{
++    if (!mask) return 0;
++    *index = 63ul - (unsigned long)__builtin_clzll(mask);
++    return 1;
++}
++
++#define _ReadWriteBarrier()  __sync_synchronize()
++#define _MemoryBarrier()     __sync_synchronize()
++
++#endif /* !_WIN32 */
++#endif /* PLATFORM_INTRIN_SHIM_H */
+diff --git a/src/platform/mmio_decode.h b/src/platform/mmio_decode.h
+index 047b146..1b82111 100644
+--- a/src/platform/mmio_decode.h
++++ b/src/platform/mmio_decode.h
+@@ -31,6 +31,12 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#elif defined(__linux__)
++/* The decoder works on the Win32-layout CONTEXT, which the sigaction VEH
++ * in win32_compat.c fills from ucontext_t on Linux. */
++#include "win32_compat.h"
++#endif
++#if defined(_WIN32) || defined(__linux__)
+ 
+ /* Service one register access. dev is passed straight back to the callbacks. */
+ typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
+@@ -321,5 +327,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+     }
+ }
+ 
+-#endif /* _WIN32 */
++#endif /* _WIN32 || __linux__ */
+ #endif /* MMIO_DECODE_H */
+diff --git a/src/platform/timeapi.h b/src/platform/timeapi.h
+new file mode 100644
+index 0000000..af9f33d
+--- /dev/null
++++ b/src/platform/timeapi.h
+@@ -0,0 +1,20 @@
++/*
++ * timeapi.h - POSIX shim. Linux-only in practice: see windows.h in this
++ * directory for why this include path cannot shadow the SDK on Windows.
++ * The timer-resolution calls are hints on Windows; Linux timer resolution
++ * needs no raising, so they succeed doing nothing.
++ */
++#ifndef PLATFORM_TIMEAPI_SHIM_H
++#define PLATFORM_TIMEAPI_SHIM_H
++
++#if !defined(_WIN32)
++
++#include "win32_compat.h"
++
++typedef unsigned int TIMERR;
++#define TIMERR_NOERROR 0
++static inline TIMERR timeBeginPeriod(unsigned int period) { (void)period; return TIMERR_NOERROR; }
++static inline TIMERR timeEndPeriod(unsigned int period)   { (void)period; return TIMERR_NOERROR; }
++
++#endif /* !_WIN32 */
++#endif /* PLATFORM_TIMEAPI_SHIM_H */
+diff --git a/src/platform/win32_compat.c b/src/platform/win32_compat.c
+index e63d153..6a07bc3 100644
+--- a/src/platform/win32_compat.c
++++ b/src/platform/win32_compat.c
+@@ -62,6 +62,15 @@ LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
+     return cmp;
+ }
+ 
++LONGLONG InterlockedIncrement64(volatile LONGLONG *p)        { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
++LONGLONG InterlockedDecrement64(volatile LONGLONG *p)        { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
++LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
++LONGLONG InterlockedExchangeAdd64(volatile LONGLONG *p, LONGLONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
++LONG InterlockedOr(volatile LONG *p, LONG v)  { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
++LONG InterlockedAdd(volatile LONG *p, LONG v)        { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
++LONGLONG InterlockedAdd64(volatile LONGLONG *p, LONGLONG v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
++VOID YieldProcessor(void) { __builtin_ia32_pause(); }
++LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+ LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
+ {
+     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+@@ -201,11 +210,22 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
+ /* Forward decl; the definition lives further down with the wait helpers. */
+ static void deadline_from_ms(DWORD ms, struct timespec *ts);
+ 
++/* One representation for every condition-variable flavour: the SRW variant
++ * needs a generation counter so its release-wait-reacquire sequence cannot
++ * lose a wake that lands between the release and the wait. */
++typedef struct W32Cv {
++    pthread_cond_t  cond;
++    pthread_mutex_t mutex;
++    unsigned        generation;
++} W32Cv;
++
+ static void cv_lazy_init(PCONDITION_VARIABLE cv)
+ {
+     if (!cv->Ptr) {
+-        pthread_cond_t *c = (pthread_cond_t *)malloc(sizeof(pthread_cond_t));
+-        pthread_cond_init(c, NULL);
++        W32Cv *c = (W32Cv *)malloc(sizeof(W32Cv));
++        pthread_cond_init(&c->cond, NULL);
++        pthread_mutex_init(&c->mutex, NULL);
++        c->generation = 0;
+         /* Race window OK for typical Win32 usage (the CS is held). */
+         cv->Ptr = c;
+     }
+@@ -221,7 +241,7 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
+ {
+     cv_lazy_init(cv);
+     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
+-    pthread_cond_t  *c = (pthread_cond_t  *)cv->Ptr;
++    pthread_cond_t  *c = &((W32Cv *)cv->Ptr)->cond;
+     pthread_mutex_t *m = (pthread_mutex_t *)cs->LockSemaphore;
+     if (ms == INFINITE) {
+         pthread_cond_wait(c, m);
+@@ -236,14 +256,56 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
+ 
+ VOID WakeConditionVariable(PCONDITION_VARIABLE cv)
+ {
++    W32Cv *w;
+     cv_lazy_init(cv);
+-    pthread_cond_signal((pthread_cond_t *)cv->Ptr);
++    w = (W32Cv *)cv->Ptr;
++    pthread_mutex_lock(&w->mutex);
++    w->generation++;
++    pthread_cond_signal(&w->cond);
++    pthread_mutex_unlock(&w->mutex);
+ }
+ 
+ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
+ {
++    W32Cv *w;
++    cv_lazy_init(cv);
++    w = (W32Cv *)cv->Ptr;
++    pthread_mutex_lock(&w->mutex);
++    w->generation++;
++    pthread_cond_broadcast(&w->cond);
++    pthread_mutex_unlock(&w->mutex);
++}
++
++BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags)
++{
++    W32Cv *w;
++    unsigned gen;
++    int shared = (flags & CONDITION_VARIABLE_LOCKMODE_SHARED) != 0;
++    int rc = 0;
++
+     cv_lazy_init(cv);
+-    pthread_cond_broadcast((pthread_cond_t *)cv->Ptr);
++    w = (W32Cv *)cv->Ptr;
++    pthread_mutex_lock(&w->mutex);
++    gen = w->generation;
++    if (shared) ReleaseSRWLockShared(lock);
++    else        ReleaseSRWLockExclusive(lock);
++    if (ms == INFINITE) {
++        while (w->generation == gen)
++            pthread_cond_wait(&w->cond, &w->mutex);
++    } else {
++        struct timespec ts;
++        deadline_from_ms(ms, &ts);
++        while (w->generation == gen) {
++            rc = pthread_cond_timedwait(&w->cond, &w->mutex, &ts);
++            if (rc == ETIMEDOUT)
++                break;
++        }
++    }
++    pthread_mutex_unlock(&w->mutex);
++    if (shared) AcquireSRWLockShared(lock);
++    else        AcquireSRWLockExclusive(lock);
++    if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
++    return TRUE;
+ }
+ 
+ /* ===================================================================== */
+@@ -968,6 +1030,11 @@ BOOL TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
+ /* Waitable timers                                                       */
+ /* ===================================================================== */
+ 
++HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access)
++{
++    (void)name; (void)flags; (void)access;
++    return CreateWaitableTimerW(sa, FALSE, NULL);
++}
+ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+ {
+     (void)sa;
+@@ -1025,6 +1092,12 @@ BOOL CancelWaitableTimer(HANDLE h)
+ /* Heap (thin wrapper over malloc; the single process heap)              */
+ /* ===================================================================== */
+ 
++/* Length registry for VirtualFree/munmap, defined with the view helpers
++ * below; declared here because VirtualAlloc/VirtualFree use it on every
++ * POSIX host (the __APPLE__ block further down repeats these for Mach). */
++void view_register(void *addr, size_t len);
++size_t view_take(const void *addr);
++
+ static w32_object s_process_heap = { .kind = K_HEAP };
+ 
+ HANDLE GetProcessHeap(void)                       { return (HANDLE)&s_process_heap; }
+@@ -1750,6 +1823,16 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
+     return sizeof(*buffer);
+ }
+ 
++VOID GetSystemInfo(LPSYSTEM_INFO si)
++{
++    long n = sysconf(_SC_NPROCESSORS_ONLN);
++    memset(si, 0, sizeof(*si));
++    si->dwNumberOfProcessors = n > 0 ? (DWORD)n : 1;
++    si->dwPageSize = (DWORD)sysconf(_SC_PAGESIZE);
++    si->dwAllocationGranularity = si->dwPageSize;
++    si->wProcessorArchitecture = 9; /* PROCESSOR_ARCHITECTURE_AMD64 */
++}
++
+ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
+ {
+     if (!b) return FALSE;
+@@ -1912,8 +1995,171 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
+     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
+ }
+ 
++/* ---- Vectored exception handling over POSIX signals ---------------------
++ * The recompiled game traps guest MMIO (APU/NV2A registers live in pages the
++ * memory layout leaves unmapped) and diagnoses crashes through Win32 VEH.
++ * This maps the hardware signals onto the same contract: build an
++ * EXCEPTION_RECORD + CONTEXT from the ucontext, run the registered handlers
++ * (First handlers before the rest, each group in registration order), and
++ * when one returns EXCEPTION_CONTINUE_EXECUTION write the context back --
++ * the MMIO decoders advance Rip past the faulting instruction -- and resume.
++ * If nobody handles it, restore the default disposition and return, so the
++ * faulting instruction re-executes and the process dies by the real signal.
++ * Handlers run on the faulting thread with the signal blocked; a handler
++ * that itself faults recurses once and then hits the default action. */
++#if defined(__x86_64__) && defined(__linux__)
++#include <ucontext.h>
++
++#define VEH_MAX_HANDLERS 16
++typedef struct VehEntry {
++    PVECTORED_EXCEPTION_HANDLER handler;
++    ULONG first;
++} VehEntry;
++static VehEntry s_veh[VEH_MAX_HANDLERS];
++static volatile int s_veh_count;
++static volatile int s_veh_installed;
++
++static DWORD veh_exception_code(int sig, siginfo_t *info)
++{
++    switch (sig) {
++    case SIGSEGV: case SIGBUS: return EXCEPTION_ACCESS_VIOLATION;
++    case SIGILL:  return EXCEPTION_ILLEGAL_INSTRUCTION;
++    case SIGTRAP: return EXCEPTION_SINGLE_STEP;
++    case SIGFPE:
++        switch (info ? info->si_code : 0) {
++        case FPE_INTDIV: return EXCEPTION_INT_DIVIDE_BY_ZERO;
++        case FPE_INTOVF: return 0xC0000095u; /* EXCEPTION_INT_OVERFLOW */
++        case FPE_FLTDIV: return EXCEPTION_FLT_DIVIDE_BY_ZERO;
++        case FPE_FLTUND: return EXCEPTION_FLT_UNDERFLOW;
++        case FPE_FLTOVF: return EXCEPTION_FLT_OVERFLOW;
++        case FPE_FLTRES: return EXCEPTION_FLT_INEXACT_RESULT;
++        default:         return EXCEPTION_FLT_INVALID_OPERATION;
++        }
++    default: return EXCEPTION_ACCESS_VIOLATION;
++    }
++}
++
++static void veh_context_from_ucontext(const ucontext_t *uc, CONTEXT *ctx)
++{
++    const greg_t *g = uc->uc_mcontext.gregs;
++    memset(ctx, 0, sizeof(*ctx));
++    ctx->Rax = (uint64_t)g[REG_RAX]; ctx->Rcx = (uint64_t)g[REG_RCX];
++    ctx->Rdx = (uint64_t)g[REG_RDX]; ctx->Rbx = (uint64_t)g[REG_RBX];
++    ctx->Rsp = (uint64_t)g[REG_RSP]; ctx->Rbp = (uint64_t)g[REG_RBP];
++    ctx->Rsi = (uint64_t)g[REG_RSI]; ctx->Rdi = (uint64_t)g[REG_RDI];
++    ctx->R8  = (uint64_t)g[REG_R8];  ctx->R9  = (uint64_t)g[REG_R9];
++    ctx->R10 = (uint64_t)g[REG_R10]; ctx->R11 = (uint64_t)g[REG_R11];
++    ctx->R12 = (uint64_t)g[REG_R12]; ctx->R13 = (uint64_t)g[REG_R13];
++    ctx->R14 = (uint64_t)g[REG_R14]; ctx->R15 = (uint64_t)g[REG_R15];
++    ctx->Rip = (uint64_t)g[REG_RIP];
++    ctx->EFlags = (uint32_t)g[REG_EFL];
++    ctx->SegCs = (uint16_t)(g[REG_CSGSFS] & 0xFFFF);
++    if (uc->uc_mcontext.fpregs)
++        ctx->MxCsr = (DWORD)uc->uc_mcontext.fpregs->mxcsr;
++}
++
++static void veh_context_to_ucontext(const CONTEXT *ctx, ucontext_t *uc)
++{
++    greg_t *g = uc->uc_mcontext.gregs;
++    g[REG_RAX] = (greg_t)ctx->Rax; g[REG_RCX] = (greg_t)ctx->Rcx;
++    g[REG_RDX] = (greg_t)ctx->Rdx; g[REG_RBX] = (greg_t)ctx->Rbx;
++    g[REG_RSP] = (greg_t)ctx->Rsp; g[REG_RBP] = (greg_t)ctx->Rbp;
++    g[REG_RSI] = (greg_t)ctx->Rsi; g[REG_RDI] = (greg_t)ctx->Rdi;
++    g[REG_R8]  = (greg_t)ctx->R8;  g[REG_R9]  = (greg_t)ctx->R9;
++    g[REG_R10] = (greg_t)ctx->R10; g[REG_R11] = (greg_t)ctx->R11;
++    g[REG_R12] = (greg_t)ctx->R12; g[REG_R13] = (greg_t)ctx->R13;
++    g[REG_R14] = (greg_t)ctx->R14; g[REG_R15] = (greg_t)ctx->R15;
++    g[REG_RIP] = (greg_t)ctx->Rip;
++    g[REG_EFL] = (greg_t)ctx->EFlags;
++    if (uc->uc_mcontext.fpregs)
++        uc->uc_mcontext.fpregs->mxcsr = (uint16_t)(ctx->MxCsr & 0xFFFF);
++}
++
++static void veh_signal_handler(int sig, siginfo_t *info, void *uctx)
++{
++    ucontext_t *uc = (ucontext_t *)uctx;
++    CONTEXT ctx;
++    EXCEPTION_RECORD record;
++    EXCEPTION_POINTERS pointers;
++    int i, pass;
++
++    veh_context_from_ucontext(uc, &ctx);
++    memset(&record, 0, sizeof(record));
++    record.ExceptionCode = veh_exception_code(sig, info);
++    record.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
++    if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
++        record.NumberParameters = 2;
++        /* x86 page-fault error code: bit 1 set = the access was a write. */
++        record.ExceptionInformation[0] =
++            (uc->uc_mcontext.gregs[REG_ERR] & 0x2) ? 1 : 0;
++        record.ExceptionInformation[1] =
++            (ULONG_PTR)(uintptr_t)(info ? info->si_addr : NULL);
++    }
++    pointers.ExceptionRecord = &record;
++    pointers.ContextRecord = &ctx;
++
++    for (pass = 0; pass < 2; pass++) {
++        for (i = 0; i < s_veh_count; i++) {
++            LONG result;
++            if ((pass == 0) != (s_veh[i].first != 0))
++                continue;
++            result = s_veh[i].handler(&pointers);
++            if (result == EXCEPTION_CONTINUE_EXECUTION) {
++                veh_context_to_ucontext(&ctx, uc);
++                return;
++            }
++            if (result == EXCEPTION_EXECUTE_HANDLER)
++                break;
++        }
++    }
++    /* Unhandled: die by the real signal, not by re-entering this handler. */
++    signal(sig, SIG_DFL);
++}
++
++static void veh_install_locked(void)
++{
++    static const int kSignals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP };
++    struct sigaction sa;
++    size_t i;
++    if (s_veh_installed)
++        return;
++    s_veh_installed = 1;
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_sigaction = veh_signal_handler;
++    sa.sa_flags = SA_SIGINFO;
++    sigemptyset(&sa.sa_mask);
++    for (i = 0; i < sizeof(kSignals) / sizeof(kSignals[0]); i++)
++        sigaction(kSignals[i], &sa, NULL);
++}
++
+ PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
++{
++    int slot;
++    if (!Handler || s_veh_count >= VEH_MAX_HANDLERS)
++        return NULL;
++    veh_install_locked();
++    slot = s_veh_count++;
++    s_veh[slot].handler = Handler;
++    s_veh[slot].first = First;
++    /* The entry itself is the opaque handle, as on Windows. */
++    return (PVOID)&s_veh[slot];
++}
++
++ULONG RemoveVectoredExceptionHandler(PVOID Handle)
++{
++    int i;
++    for (i = 0; i < s_veh_count; i++) {
++        if ((PVOID)&s_veh[i] == Handle) {
++            s_veh[i].handler = NULL;
++            return 1;
++        }
++    }
++    return 0;
++}
++#else
++PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
++{ (void)First; (void)Handler; return NULL; }
+ ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
++#endif
+ 
+ #endif /* !_WIN32 */
+diff --git a/src/platform/win32_compat.h b/src/platform/win32_compat.h
+index 3be0e2d..1648859 100644
+--- a/src/platform/win32_compat.h
++++ b/src/platform/win32_compat.h
+@@ -60,6 +60,7 @@ extern "C" {
+ #define MEM_PRIVATE    0x00020000u
+ #define MEM_TOP_DOWN   0x00100000u
+ #define PAGE_NOACCESS          0x01u
++#define PAGE_GUARD             0x100u  /* reported by VirtualQuery; PROT_NONE pages read as guarded */
+ #define PAGE_READONLY          0x02u
+ #define PAGE_READWRITE         0x04u
+ #define PAGE_WRITECOPY         0x08u
+@@ -91,6 +92,18 @@ LONG InterlockedExchange(volatile LONG *Target, LONG Value);
+ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
+ LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+ LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
++LONGLONG InterlockedIncrement64(volatile LONGLONG *Addend);
++LONGLONG InterlockedDecrement64(volatile LONGLONG *Addend);
++LONGLONG InterlockedExchange64(volatile LONGLONG *Target, LONGLONG Value);
++LONGLONG InterlockedExchangeAdd64(volatile LONGLONG *Addend, LONGLONG Value);
++LONG InterlockedOr(volatile LONG *Target, LONG Value);
++LONG InterlockedAdd(volatile LONG *Addend, LONG Value);
++LONGLONG InterlockedAdd64(volatile LONGLONG *Addend, LONGLONG Value);
++VOID YieldProcessor(void);
++#ifndef MemoryBarrier
++#define MemoryBarrier() __sync_synchronize()
++#endif
++LONG InterlockedAnd(volatile LONG *Target, LONG Value);
+ PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+ 
+ /* ---- Critical sections ------------------------------------------------- */
+@@ -114,6 +127,8 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
+ /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
+ VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
+ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms);
++#define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1
++BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags);
+ VOID WakeConditionVariable(PCONDITION_VARIABLE cv);
+ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv);
+ 
+@@ -188,6 +203,11 @@ BOOL   TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
+ /* ---- Waitable timers --------------------------------------------------- */
+ typedef VOID (*PTIMERAPCROUTINE)(PVOID arg, DWORD lowValue, DWORD highValue);
+ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
++#ifndef TIMER_ALL_ACCESS
++#define TIMER_ALL_ACCESS 0x1F0003u
++#endif
++/* High-resolution flag accepted and dropped: POSIX timers need no raising. */
++HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access);
+ BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                         PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
+ BOOL   CancelWaitableTimer(HANDLE h);
+@@ -228,6 +248,7 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
+ 
+ /* MSVC stack alloca alias. <alloca.h> provides the underlying function. */
+ #include <alloca.h>
++#include <stdio.h>
+ #define _alloca(n) alloca(n)
+ 
+ /* ---- Win32 file API (POSIX-backed) ----------------------------------- */
+@@ -417,6 +438,36 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
+ #define FAILED(hr)      (((HRESULT)(hr)) < 0)
+ #endif
+ 
++/* ---- MSVC secure-CRT spellings used by the PC layers ------------------- */
++#ifndef _TRUNCATE
++#define _TRUNCATE ((size_t)-1)
++#endif
++static inline int strncpy_s(char *dst, size_t dst_size, const char *src, size_t count)
++{
++    size_t n;
++    if (!dst || !dst_size) return 22;
++    if (!src) { dst[0] = 0; return 22; }
++    n = strlen(src);
++    if (count != _TRUNCATE && count < n) n = count;
++    if (n >= dst_size) n = dst_size - 1;
++    memcpy(dst, src, n);
++    dst[n] = 0;
++    return 0;
++}
++static inline int _snprintf_s(char *dst, size_t dst_size, size_t count, const char *fmt, ...)
++{
++    int r;
++    va_list ap;
++    (void)count;
++    if (!dst || !dst_size) return -1;
++    va_start(ap, fmt);
++    r = vsnprintf(dst, dst_size, fmt, ap);
++    va_end(ap);
++    if (r < 0 || (size_t)r >= dst_size) { dst[dst_size - 1] = 0; return -1; }
++    return r;
++}
++#define strtok_s strtok_r
++
+ /* ---- Exception records (SEH compile-shim; not yet emulated) ----------- */
+ #define EXCEPTION_MAXIMUM_PARAMETERS 15
+ typedef struct _EXCEPTION_RECORD {
+@@ -432,11 +483,18 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
+                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
+ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
+ 
+-/* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
+- * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
+- * ucontext_t; for now we accept the registration and never fire. */
+-typedef void *PEXCEPTION_POINTERS;
++/* Win32 VEH, implemented on Linux over sigaction(SIGSEGV/SIGBUS/SIGFPE/
++ * SIGILL/SIGTRAP) + ucontext_t: handlers receive a real EXCEPTION_POINTERS
++ * whose ContextRecord is a CONTEXT in Win32 layout (see xbox_winnt.h).
++ * EXCEPTION_CONTINUE_EXECUTION writes the context back and resumes. */
++typedef struct _EXCEPTION_POINTERS {
++    PEXCEPTION_RECORD ExceptionRecord;
++    PCONTEXT          ContextRecord;
++} EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
+ typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
++#ifndef EXCEPTION_SINGLE_STEP
++#define EXCEPTION_SINGLE_STEP     0x80000004u
++#endif
+ PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
+ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
+ 
+@@ -447,6 +505,8 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
+ #define EXCEPTION_STACK_OVERFLOW         0xC00000FDu
+ #define EXCEPTION_ILLEGAL_INSTRUCTION    0xC000001Du
+ #define EXCEPTION_INT_DIVIDE_BY_ZERO     0xC0000094u
++#define EXCEPTION_INT_OVERFLOW           0xC0000095u
++#define EXCEPTION_PRIV_INSTRUCTION       0xC0000096u
+ #define EXCEPTION_FLT_DIVIDE_BY_ZERO     0xC000008Eu
+ #define EXCEPTION_FLT_INVALID_OPERATION  0xC0000090u
+ #define EXCEPTION_FLT_STACK_CHECK        0xC0000092u
+@@ -480,6 +540,21 @@ typedef struct _MEMORYSTATUSEX {
+ } MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
+ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX buffer);
+ 
++typedef struct _SYSTEM_INFO {
++    WORD  wProcessorArchitecture;
++    WORD  wReserved;
++    DWORD dwPageSize;
++    LPVOID lpMinimumApplicationAddress;
++    LPVOID lpMaximumApplicationAddress;
++    DWORD_PTR dwActiveProcessorMask;
++    DWORD dwNumberOfProcessors;
++    DWORD dwProcessorType;
++    DWORD dwAllocationGranularity;
++    WORD  wProcessorLevel;
++    WORD  wProcessorRevision;
++} SYSTEM_INFO, *LPSYSTEM_INFO;
++VOID GetSystemInfo(LPSYSTEM_INFO lpSystemInfo);
++
+ /* ---- File mapping (memfd-backed; gives true aliased mirror views) ----- */
+ #define FILE_MAP_COPY        0x00000001u
+ #define FILE_MAP_WRITE       0x00000002u
+diff --git a/src/platform/windows.h b/src/platform/windows.h
+new file mode 100644
+index 0000000..031c02b
+--- /dev/null
++++ b/src/platform/windows.h
+@@ -0,0 +1,31 @@
++/*
++ * windows.h - POSIX shim, found only on the Linux include path.
++ *
++ * src/platform/CMakeLists.txt puts this directory on the include path only
++ * for the non-Windows `platform` target (on Windows that target is an
++ * INTERFACE library exposing just src/), so a real Windows SDK header of
++ * the same name always wins there and this file is Linux-only in practice.
++ * The explicit _WIN32 guard below keeps that true even if the directory
++ * ever leaks into a Windows include path.
++ *
++ * Runtime code written against <windows.h> (the Kelvin renderer, the PC
++ * input/video layers) compiles unchanged against the POSIX implementation
++ * of the same primitives in win32_compat.h.
++ */
++#ifndef PLATFORM_WINDOWS_SHIM_H
++#define PLATFORM_WINDOWS_SHIM_H
++
++#if !defined(_WIN32)
++
++#include "win32_compat.h"
++
++/* MSVC spellings that survive in the renderer sources. */
++#ifndef __int64
++#define __int64 long long
++#endif
++#ifndef __forceinline
++#define __forceinline inline __attribute__((always_inline))
++#endif
++
++#endif /* !_WIN32 */
++#endif /* PLATFORM_WINDOWS_SHIM_H */
+diff --git a/src/platform/xbox_winnt.h b/src/platform/xbox_winnt.h
+index 707e991..290d5e3 100644
+--- a/src/platform/xbox_winnt.h
++++ b/src/platform/xbox_winnt.h
+@@ -147,9 +147,25 @@ typedef void             **PHANDLE, **LPHANDLE;
+ typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
+ typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
+ 
+-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
+- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
++/* Windows VEH register state. On Linux this is a real struct with the Win32
++ * field layout the MMIO instruction decoders and crash handlers use; the
++ * sigaction-based VEH in win32_compat.c fills it from ucontext_t and writes
++ * it back when a handler asks to continue execution. */
++#if defined(__x86_64__)
++typedef struct _CONTEXT {
++    uint64_t P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
++    uint32_t ContextFlags;
++    uint32_t MxCsr;
++    uint16_t SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
++    uint32_t EFlags;
++    uint64_t Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
++    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
++    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
++    uint64_t Rip;
++} CONTEXT, *PCONTEXT;
++#else
+ typedef void              *PCONTEXT;
++#endif
+ 
+ /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
+ typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
+diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
+index 175c522..833c58b 100644
+--- a/src/video/CMakeLists.txt
++++ b/src/video/CMakeLists.txt
+@@ -16,4 +16,8 @@ target_include_directories(xbox_video PUBLIC
+ target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input)
+ if(WIN32)
+     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 gdi32 user32)
++else()
++    # fb_present.c is the SDL2 presenter off Windows.
++    find_package(SDL2 REQUIRED)
++    target_link_libraries(xbox_video PUBLIC SDL2::SDL2)
+ endif()
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 80c3783..a2be769 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -962,20 +962,500 @@ void xbox_FramebufferWindowStart(void)
+     fb_start();
+     _mm_setcsr(csr);
+ }
+-#else
+-void xbox_FramebufferPublish(const void *s, size_t n, uint32_t va, uint32_t w,
+-    uint32_t h, uint32_t p, uint32_t f) { (void)s; (void)n; (void)va; (void)w; (void)h; (void)p; (void)f; }
+-void xbox_FramebufferPublishAspect(const void *s, size_t n, uint32_t va,
+-    uint32_t w, uint32_t h, uint32_t p, uint32_t f, uint32_t a, uint32_t b)
+-{ (void)s; (void)n; (void)va; (void)w; (void)h; (void)p; (void)f; (void)a; (void)b; }
+-void xbox_FramebufferWindowSet(uint32_t va, uint32_t p) { (void)va; (void)p; }
+-void xbox_FramebufferWindowStart(void) {}
+-int xbox_FramebufferDumpBmp(const char *path) { (void)path; return -1; }
+-uint64_t xbox_FramebufferMovieBegin(void) { return 0; }
+-int xbox_FramebufferMovieActive(void) { return 0; }
+-int xbox_FramebufferRequestClose(void) { return 0; }
+-void xbox_FramebufferMoviePublish(uint64_t t, const void *s, size_t n, uint32_t w,
+-    uint32_t h, uint32_t p, uint32_t a, uint32_t b) { (void)t; (void)s; (void)n; (void)w; (void)h; (void)p; (void)a; (void)b; }
+-void xbox_FramebufferMovieEnd(uint64_t t) { (void)t; }
+-void xbox_FramebufferInputByCaller(int on) { (void)on; }
++#else /* !_WIN32 -- SDL2 presenter (Linux) */
++/*
++ * The same contract as the D3D11 presenter, on SDL2: producers copy a
++ * completed frame into a one-deep mailbox (pixel conversion included),
++ * the presenter thread owns the window, uploads the newest frame to a
++ * streaming texture and scales it with fb_present_rect(), and SDL events
++ * feed the same pc_input host-event functions Win32 messages feed on
++ * Windows (set-1 scancodes, relative mouse motion, wheel deltas of 120).
++ * Kelvin GPU shared-texture frames stay Windows-only: GpuWanted is 0, so
++ * the renderer keeps the CPU publication path, exactly as when the GPU
++ * backend is off there.
++ */
++#include <SDL.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++enum { FB_NOT_STARTED, FB_RUNNING, FB_CLOSED };
++typedef struct FbFrame {
++    uint32_t width, height, va, aspect_w, aspect_h;
++    uint64_t movie_token;
++    uint32_t pixels[];
++} FbFrame;
++
++static pthread_mutex_t s_frames_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t  s_frame_ready  = PTHREAD_COND_INITIALIZER;
++static pthread_once_t  s_once = PTHREAD_ONCE_INIT;
++static int s_enabled, s_state, s_close_requested, s_input_by_caller;
++static FbFrame *s_pending, *s_displayed;
++static uint64_t s_movie_token, s_movie_next;
++static FbPresentPolicy s_policy;
++static uint32_t s_pin_va;
++static const char *s_dump;
++
++static void fb_policy_from_video(const PcVideoSettings *v)
++{
++    unsigned num, den;
++    s_policy.width = v->window_width; s_policy.height = v->window_height;
++    s_policy.scale = v->scale == PCV_SCALE_STRETCH ? FB_SCALE_STRETCH :
++                     v->scale == PCV_SCALE_INTEGER ? FB_SCALE_INTEGER : FB_SCALE_FIT;
++    s_policy.nearest = v->nearest; s_policy.vsync = v->vsync;
++    s_policy.fps_limit = v->fps_limit;
++    pc_video_aspect_ratio(v->aspect, &num, &den);
++    s_policy.aspect_w = num; s_policy.aspect_h = den;
++    s_policy.borderless = v->borderless;
++}
++
++static void fb_initialize(void)
++{
++    const char *pin;
++    PcVideoSettings v;
++    s_enabled = getenv("RECOMP_FB_WINDOW") != NULL;
++    pc_video_get(&v);
++    fb_policy_from_video(&v);
++    pin = getenv("RECOMP_FB_VA");
++    s_pin_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : 0;
++    s_dump = getenv("RECOMP_FB_DUMP");
++}
++
++static void fb_publish(const void *source, size_t source_bytes, uint32_t va,
++    uint32_t width, uint32_t height, uint32_t pitch, uint32_t format,
++    uint64_t movie_token, uint32_t aspect_w, uint32_t aspect_h)
++{
++    FbFrame *frame, *old;
++    unsigned bpp, x, y;
++    uint64_t row_bytes, required, count;
++    const uint8_t *bytes = (const uint8_t *)source;
++
++    pthread_once(&s_once, fb_initialize);
++    if (!source || !width || !height || width > 8192 || height > 8192 ||
++        s_state == FB_CLOSED)
++        return;
++    if (movie_token && (!aspect_w || !aspect_h))
++        return;
++    bpp = format >= 1 && format <= 3 ? 2 : format >= 4 && format <= 8 ? 4 : 0;
++    if (!bpp)
++        return;
++    row_bytes = (uint64_t)width * bpp;
++    required = (uint64_t)(height - 1) * pitch + row_bytes;
++    count = (uint64_t)width * height;
++    if ((!aspect_w != !aspect_h) || pitch < row_bytes || required > source_bytes ||
++        count > (SIZE_MAX - sizeof(*frame)) / sizeof(uint32_t))
++        return;
++    /* A validated completed frame drives input context even headless. */
++    if (movie_token || !s_input_by_caller)
++        pc_input_frame_complete();
++    pthread_mutex_lock(&s_frames_lock);
++    {
++        int allowed = movie_token ? movie_token == s_movie_token : s_movie_token == 0;
++        if (!allowed) { pthread_mutex_unlock(&s_frames_lock); return; }
++    }
++    pthread_mutex_unlock(&s_frames_lock);
++    if (!s_enabled || (!movie_token && s_pin_va && s_pin_va != va))
++        return;
++    frame = (FbFrame *)malloc(sizeof(*frame) + (size_t)count * sizeof(uint32_t));
++    if (!frame)
++        return;
++    frame->width = width; frame->height = height; frame->va = va;
++    frame->movie_token = movie_token; frame->aspect_w = aspect_w; frame->aspect_h = aspect_h;
++    for (y = 0; y < height; ++y) {
++        const uint8_t *row = bytes + (size_t)y * pitch;
++        uint32_t *dst = frame->pixels + (size_t)y * width;
++        if (bpp == 4) memcpy(dst, row, (size_t)width * 4);
++        else for (x = 0; x < width; ++x) {
++            uint16_t v; unsigned r, g, b;
++            memcpy(&v, row + x * 2, sizeof(v));
++            if (format == 3) { r = ((v >> 11) & 31) * 255u / 31u; g = ((v >> 5) & 63) * 255u / 63u; }
++            else { r = ((v >> 10) & 31) * 255u / 31u; g = ((v >> 5) & 31) * 255u / 31u; }
++            b = (v & 31) * 255u / 31u;
++            dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
++        }
++    }
++    pthread_mutex_lock(&s_frames_lock);
++    if (s_state == FB_CLOSED ||
++        (movie_token ? movie_token != s_movie_token : s_movie_token != 0)) {
++        pthread_mutex_unlock(&s_frames_lock);
++        free(frame);
++        return;
++    }
++    old = s_pending; s_pending = frame;
++    pthread_cond_signal(&s_frame_ready);
++    pthread_mutex_unlock(&s_frames_lock);
++    free(old);
++}
++
++void xbox_FramebufferPublish(const void *source, size_t source_bytes, uint32_t va,
++    uint32_t width, uint32_t height, uint32_t pitch, uint32_t format)
++{
++    fb_publish(source, source_bytes, va, width, height, pitch, format, 0, 0, 0);
++}
++void xbox_FramebufferPublishAspect(const void *source, size_t source_bytes,
++    uint32_t va, uint32_t width, uint32_t height, uint32_t pitch,
++    uint32_t format, uint32_t aspect_w, uint32_t aspect_h)
++{
++    fb_publish(source, source_bytes, va, width, height, pitch, format,
++               0, aspect_w, aspect_h);
++}
++void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
++
++uint64_t xbox_FramebufferMovieBegin(void)
++{
++    uint64_t token = 0;
++    pthread_once(&s_once, fb_initialize);
++    pthread_mutex_lock(&s_frames_lock);
++    if (s_enabled && s_state != FB_CLOSED) {
++        if (!++s_movie_next) ++s_movie_next;
++        token = s_movie_token = s_movie_next;
++        free(s_pending); s_pending = NULL;
++    }
++    pthread_mutex_unlock(&s_frames_lock);
++    return token;
++}
++void xbox_FramebufferMoviePublish(uint64_t token, const void *source, size_t bytes,
++    uint32_t width, uint32_t height, uint32_t pitch, uint32_t aspect_w, uint32_t aspect_h)
++{
++    if (token)
++        fb_publish(source, bytes, 0, width, height, pitch, 8, token, aspect_w, aspect_h);
++}
++int xbox_FramebufferMovieActive(void)
++{
++    int active;
++    pthread_mutex_lock(&s_frames_lock);
++    active = s_movie_token != 0;
++    pthread_mutex_unlock(&s_frames_lock);
++    return active;
++}
++void xbox_FramebufferMovieEnd(uint64_t token)
++{
++    pthread_mutex_lock(&s_frames_lock);
++    if (token && s_movie_token == token) {
++        s_movie_token = 0;
++        if (s_pending && s_pending->movie_token == token) { free(s_pending); s_pending = NULL; }
++    }
++    pthread_mutex_unlock(&s_frames_lock);
++}
++void xbox_FramebufferInputByCaller(int on) { s_input_by_caller = on ? 1 : 0; }
++
++/* GPU-resident frames are a Windows presentation feature. */
++void xbox_FramebufferGpuAdapter(uint32_t luid_low, int32_t luid_high)
++{ (void)luid_low; (void)luid_high; }
++int xbox_FramebufferGpuWanted(void) { return 0; }
++int xbox_FramebufferGpuFailed(void) { return 0; }
++int xbox_FramebufferGpuRegister(void *const *textures, unsigned count,
++    void *frame_fence, void *done_fence, uint32_t width, uint32_t height)
++{
++    (void)textures; (void)count; (void)frame_fence; (void)done_fence;
++    (void)width; (void)height;
++    return 0;
++}
++void xbox_FramebufferPublishGpu(unsigned slot, uint64_t value, uint32_t va,
++    uint32_t aspect_w, uint32_t aspect_h)
++{
++    (void)slot; (void)value; (void)va; (void)aspect_w; (void)aspect_h;
++    if (!s_input_by_caller)
++        pc_input_frame_complete();
++}
++
++int xbox_FramebufferDumpBmp(const char *path)
++{
++    FbFrame *copy = NULL; FILE *file; uint8_t header[54] = {0}, *line;
++    uint32_t row, image, total, x, y;
++    pthread_mutex_lock(&s_frames_lock);
++    if (s_displayed) {
++        size_t size = sizeof(*copy) + (size_t)s_displayed->width * s_displayed->height * 4;
++        copy = (FbFrame *)malloc(size);
++        if (copy) memcpy(copy, s_displayed, size);
++    }
++    pthread_mutex_unlock(&s_frames_lock);
++    if (!copy || !path) { free(copy); return -1; }
++    row = (copy->width * 3u + 3u) & ~3u; image = row * copy->height; total = 54u + image;
++    line = (uint8_t *)calloc(1, row); file = line ? fopen(path, "wb") : NULL;
++    if (!file) { free(line); free(copy); return -1; }
++    header[0] = 'B'; header[1] = 'M'; header[10] = 54; header[14] = 40;
++    memcpy(header + 2, &total, 4); memcpy(header + 18, &copy->width, 4);
++    memcpy(header + 22, &copy->height, 4); header[26] = 1; header[28] = 24;
++    memcpy(header + 34, &image, 4);
++    if (fwrite(header, 1, sizeof(header), file) != sizeof(header)) goto failed;
++    for (y = 0; y < copy->height; ++y) {
++        const uint32_t *src = copy->pixels + (size_t)(copy->height - 1 - y) * copy->width;
++        for (x = 0; x < copy->width; ++x) {
++            line[x * 3] = (uint8_t)src[x]; line[x * 3 + 1] = (uint8_t)(src[x] >> 8);
++            line[x * 3 + 2] = (uint8_t)(src[x] >> 16);
++        }
++        if (fwrite(line, 1, row, file) != row) goto failed;
++    }
++    free(line); free(copy); return fclose(file) == 0 ? 0 : -1;
++failed:
++    fclose(file); free(line); free(copy); return -1;
++}
++
++int xbox_FramebufferRequestClose(void)
++{
++    pthread_once(&s_once, fb_initialize);
++    if (s_state != FB_RUNNING)
++        return 0;
++    pthread_mutex_lock(&s_frames_lock);
++    s_close_requested = 1;
++    pthread_cond_signal(&s_frame_ready);
++    pthread_mutex_unlock(&s_frames_lock);
++    return 1;
++}
++
++/* SDL scancode (USB HID) -> PS/2 set-1 scancode + extended flag, the key
++ * ids pc_input is built on. Returns 0 for keys with no set-1 identity. */
++static int fb_sdl_to_set1(SDL_Scancode sc, unsigned *code, int *extended)
++{
++    *extended = 0;
++    switch (sc) {
++    case SDL_SCANCODE_ESCAPE: *code = 0x01; break;
++    case SDL_SCANCODE_1: *code = 0x02; break; case SDL_SCANCODE_2: *code = 0x03; break;
++    case SDL_SCANCODE_3: *code = 0x04; break; case SDL_SCANCODE_4: *code = 0x05; break;
++    case SDL_SCANCODE_5: *code = 0x06; break; case SDL_SCANCODE_6: *code = 0x07; break;
++    case SDL_SCANCODE_7: *code = 0x08; break; case SDL_SCANCODE_8: *code = 0x09; break;
++    case SDL_SCANCODE_9: *code = 0x0A; break; case SDL_SCANCODE_0: *code = 0x0B; break;
++    case SDL_SCANCODE_MINUS: *code = 0x0C; break; case SDL_SCANCODE_EQUALS: *code = 0x0D; break;
++    case SDL_SCANCODE_BACKSPACE: *code = 0x0E; break; case SDL_SCANCODE_TAB: *code = 0x0F; break;
++    case SDL_SCANCODE_Q: *code = 0x10; break; case SDL_SCANCODE_W: *code = 0x11; break;
++    case SDL_SCANCODE_E: *code = 0x12; break; case SDL_SCANCODE_R: *code = 0x13; break;
++    case SDL_SCANCODE_T: *code = 0x14; break; case SDL_SCANCODE_Y: *code = 0x15; break;
++    case SDL_SCANCODE_U: *code = 0x16; break; case SDL_SCANCODE_I: *code = 0x17; break;
++    case SDL_SCANCODE_O: *code = 0x18; break; case SDL_SCANCODE_P: *code = 0x19; break;
++    case SDL_SCANCODE_LEFTBRACKET: *code = 0x1A; break; case SDL_SCANCODE_RIGHTBRACKET: *code = 0x1B; break;
++    case SDL_SCANCODE_RETURN: *code = 0x1C; break; case SDL_SCANCODE_LCTRL: *code = 0x1D; break;
++    case SDL_SCANCODE_A: *code = 0x1E; break; case SDL_SCANCODE_S: *code = 0x1F; break;
++    case SDL_SCANCODE_D: *code = 0x20; break; case SDL_SCANCODE_F: *code = 0x21; break;
++    case SDL_SCANCODE_G: *code = 0x22; break; case SDL_SCANCODE_H: *code = 0x23; break;
++    case SDL_SCANCODE_J: *code = 0x24; break; case SDL_SCANCODE_K: *code = 0x25; break;
++    case SDL_SCANCODE_L: *code = 0x26; break; case SDL_SCANCODE_SEMICOLON: *code = 0x27; break;
++    case SDL_SCANCODE_APOSTROPHE: *code = 0x28; break; case SDL_SCANCODE_GRAVE: *code = 0x29; break;
++    case SDL_SCANCODE_LSHIFT: *code = 0x2A; break; case SDL_SCANCODE_BACKSLASH: *code = 0x2B; break;
++    case SDL_SCANCODE_Z: *code = 0x2C; break; case SDL_SCANCODE_X: *code = 0x2D; break;
++    case SDL_SCANCODE_C: *code = 0x2E; break; case SDL_SCANCODE_V: *code = 0x2F; break;
++    case SDL_SCANCODE_B: *code = 0x30; break; case SDL_SCANCODE_N: *code = 0x31; break;
++    case SDL_SCANCODE_M: *code = 0x32; break; case SDL_SCANCODE_COMMA: *code = 0x33; break;
++    case SDL_SCANCODE_PERIOD: *code = 0x34; break; case SDL_SCANCODE_SLASH: *code = 0x35; break;
++    case SDL_SCANCODE_RSHIFT: *code = 0x36; break; case SDL_SCANCODE_KP_MULTIPLY: *code = 0x37; break;
++    case SDL_SCANCODE_LALT: *code = 0x38; break; case SDL_SCANCODE_SPACE: *code = 0x39; break;
++    case SDL_SCANCODE_CAPSLOCK: *code = 0x3A; break;
++    case SDL_SCANCODE_F1: *code = 0x3B; break; case SDL_SCANCODE_F2: *code = 0x3C; break;
++    case SDL_SCANCODE_F3: *code = 0x3D; break; case SDL_SCANCODE_F4: *code = 0x3E; break;
++    case SDL_SCANCODE_F5: *code = 0x3F; break; case SDL_SCANCODE_F6: *code = 0x40; break;
++    case SDL_SCANCODE_F7: *code = 0x41; break; case SDL_SCANCODE_F8: *code = 0x42; break;
++    case SDL_SCANCODE_F9: *code = 0x43; break; case SDL_SCANCODE_F10: *code = 0x44; break;
++    case SDL_SCANCODE_NUMLOCKCLEAR: *code = 0x45; break; case SDL_SCANCODE_SCROLLLOCK: *code = 0x46; break;
++    case SDL_SCANCODE_KP_7: *code = 0x47; break; case SDL_SCANCODE_KP_8: *code = 0x48; break;
++    case SDL_SCANCODE_KP_9: *code = 0x49; break; case SDL_SCANCODE_KP_MINUS: *code = 0x4A; break;
++    case SDL_SCANCODE_KP_4: *code = 0x4B; break; case SDL_SCANCODE_KP_5: *code = 0x4C; break;
++    case SDL_SCANCODE_KP_6: *code = 0x4D; break; case SDL_SCANCODE_KP_PLUS: *code = 0x4E; break;
++    case SDL_SCANCODE_KP_1: *code = 0x4F; break; case SDL_SCANCODE_KP_2: *code = 0x50; break;
++    case SDL_SCANCODE_KP_3: *code = 0x51; break; case SDL_SCANCODE_KP_0: *code = 0x52; break;
++    case SDL_SCANCODE_KP_PERIOD: *code = 0x53; break;
++    case SDL_SCANCODE_F11: *code = 0x57; break; case SDL_SCANCODE_F12: *code = 0x58; break;
++    case SDL_SCANCODE_RCTRL: *code = 0x1D; *extended = 1; break;
++    case SDL_SCANCODE_RALT: *code = 0x38; *extended = 1; break;
++    case SDL_SCANCODE_KP_ENTER: *code = 0x1C; *extended = 1; break;
++    case SDL_SCANCODE_HOME: *code = 0x47; *extended = 1; break;
++    case SDL_SCANCODE_UP: *code = 0x48; *extended = 1; break;
++    case SDL_SCANCODE_PAGEUP: *code = 0x49; *extended = 1; break;
++    case SDL_SCANCODE_LEFT: *code = 0x4B; *extended = 1; break;
++    case SDL_SCANCODE_RIGHT: *code = 0x4D; *extended = 1; break;
++    case SDL_SCANCODE_END: *code = 0x4F; *extended = 1; break;
++    case SDL_SCANCODE_DOWN: *code = 0x50; *extended = 1; break;
++    case SDL_SCANCODE_PAGEDOWN: *code = 0x51; *extended = 1; break;
++    case SDL_SCANCODE_INSERT: *code = 0x52; *extended = 1; break;
++    case SDL_SCANCODE_DELETE: *code = 0x53; *extended = 1; break;
++    default: return 0;
++    }
++    return 1;
++}
++
++static void *fb_present_thread(void *unused)
++{
++    SDL_Window *window;
++    SDL_Renderer *renderer;
++    SDL_Texture *texture = NULL;
++    uint32_t tex_w = 0, tex_h = 0;
++    int focused = 1, captured = 0;
++    uint64_t last_present_ms = 0, presented = 0;
++    (void)unused;
++
++    if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
++        fprintf(stderr, "[FBWIN] SDL video init failed: %s\n", SDL_GetError());
++        exit(1);
++    }
++    window = SDL_CreateWindow("BLACK",
++        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
++        (int)(s_policy.width ? s_policy.width : 1280),
++        (int)(s_policy.height ? s_policy.height : 960),
++        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
++        (s_policy.borderless ? SDL_WINDOW_BORDERLESS : 0));
++    if (!window) {
++        fprintf(stderr, "[FBWIN] window creation failed: %s\n", SDL_GetError());
++        exit(1);
++    }
++    renderer = SDL_CreateRenderer(window, -1,
++        (s_policy.vsync ? SDL_RENDERER_PRESENTVSYNC : 0) | SDL_RENDERER_ACCELERATED);
++    if (!renderer)
++        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
++    if (!renderer) {
++        fprintf(stderr, "[FBWIN] renderer creation failed: %s\n", SDL_GetError());
++        exit(1);
++    }
++    fprintf(stderr, "[FBWIN] SDL presenter: %ux%u scale %u vsync %u\n",
++            s_policy.width, s_policy.height, s_policy.scale, s_policy.vsync);
++    if (s_policy.borderless)
++        SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
++
++    for (;;) {
++        SDL_Event ev;
++        FbFrame *frame = NULL;
++        int want_capture;
++
++        while (SDL_PollEvent(&ev)) {
++            switch (ev.type) {
++            case SDL_QUIT:
++                pc_input_focus_event(0);
++                s_state = FB_CLOSED;
++                fprintf(stderr, "[FBWIN] window closed\n");
++                exit(0); /* as on Windows: closing the window ends the game */
++            case SDL_KEYDOWN: case SDL_KEYUP: {
++                unsigned code; int ext;
++                if (ev.type == SDL_KEYDOWN && ev.key.keysym.scancode == SDL_SCANCODE_F11 &&
++                    !ev.key.repeat) {
++                    if (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP)
++                        SDL_SetWindowFullscreen(window, 0);
++                    else
++                        SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
++                    break;
++                }
++                if (fb_sdl_to_set1(ev.key.keysym.scancode, &code, &ext))
++                    pc_input_key_event(code, ext, ev.type == SDL_KEYDOWN,
++                                       ev.key.repeat != 0);
++                break;
++            }
++            case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
++                int button = ev.button.button == SDL_BUTTON_LEFT ? 0 :
++                             ev.button.button == SDL_BUTTON_RIGHT ? 1 :
++                             ev.button.button == SDL_BUTTON_MIDDLE ? 2 :
++                             ev.button.button == SDL_BUTTON_X1 ? 3 : 4;
++                pc_input_mouse_button_event(button, ev.type == SDL_MOUSEBUTTONDOWN);
++                break;
++            }
++            case SDL_MOUSEWHEEL:
++                pc_input_wheel_event((int)(ev.wheel.y * 120));
++                break;
++            case SDL_MOUSEMOTION:
++                if (captured)
++                    pc_input_mouse_motion(ev.motion.xrel, ev.motion.yrel);
++                break;
++            case SDL_WINDOWEVENT:
++                if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
++                    focused = 1; pc_input_focus_event(1);
++                } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
++                           ev.window.event == SDL_WINDOWEVENT_MINIMIZED) {
++                    focused = 0; pc_input_focus_event(0);
++                }
++                break;
++            default:
++                break;
++            }
++        }
++
++        want_capture = focused && pc_input_capture_wanted();
++        if (want_capture != captured) {
++            captured = want_capture;
++            SDL_SetRelativeMouseMode(captured ? SDL_TRUE : SDL_FALSE);
++            pc_input_capture_changed(captured);
++        }
++
++        pthread_mutex_lock(&s_frames_lock);
++        if (s_close_requested) {
++            pthread_mutex_unlock(&s_frames_lock);
++            pc_input_focus_event(0);
++            exit(0);
++        }
++        if (s_pending) {
++            FbFrame *old = s_displayed;
++            s_displayed = s_pending; s_pending = NULL;
++            frame = s_displayed;
++            pthread_mutex_unlock(&s_frames_lock);
++            free(old);
++        } else {
++            struct timespec ts;
++            clock_gettime(CLOCK_REALTIME, &ts);
++            ts.tv_nsec += 8 * 1000 * 1000;
++            if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
++            pthread_cond_timedwait(&s_frame_ready, &s_frames_lock, &ts);
++            pthread_mutex_unlock(&s_frames_lock);
++        }
++        if (!frame)
++            continue;
++
++        {
++            uint64_t now_ms = SDL_GetTicks64();
++            if (s_policy.fps_limit) {
++                uint64_t interval = 1000 / s_policy.fps_limit;
++                if (now_ms - last_present_ms < interval)
++                    continue;
++                last_present_ms = now_ms;
++            }
++        }
++        if (!texture || tex_w != frame->width || tex_h != frame->height) {
++            if (texture) SDL_DestroyTexture(texture);
++            texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
++                                        SDL_TEXTUREACCESS_STREAMING,
++                                        (int)frame->width, (int)frame->height);
++            if (!texture)
++                continue;
++            tex_w = frame->width; tex_h = frame->height;
++            SDL_SetTextureScaleMode(texture,
++                s_policy.nearest ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
++        }
++        if (SDL_UpdateTexture(texture, NULL, frame->pixels,
++                              (int)(frame->width * 4)) < 0)
++            continue;
++        {
++            int cw, ch;
++            FbPresentRect r;
++            SDL_Rect dst;
++            SDL_GetRendererOutputSize(renderer, &cw, &ch);
++            r = fb_present_rect((unsigned)cw, (unsigned)ch, frame->width, frame->height,
++                frame->aspect_w ? FB_SCALE_FIT : s_policy.scale, s_policy.nearest,
++                frame->aspect_w ? frame->aspect_w : s_policy.aspect_w,
++                frame->aspect_h ? frame->aspect_h : s_policy.aspect_h);
++            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
++            SDL_RenderClear(renderer);
++            dst.x = (int)r.x; dst.y = (int)r.y;
++            dst.w = (int)r.width; dst.h = (int)r.height;
++            if (dst.w > 0 && dst.h > 0)
++                SDL_RenderCopy(renderer, texture, NULL, &dst);
++            SDL_RenderPresent(renderer);
++            presented++;
++            if (s_dump && presented == 60)
++                xbox_FramebufferDumpBmp(s_dump);
++        }
++    }
++    return NULL;
++}
++
++void xbox_FramebufferWindowStart(void)
++{
++    pthread_t thread;
++    pthread_once(&s_once, fb_initialize);
++    if (!s_enabled)
++        return;
++    if (__sync_lock_test_and_set(&s_state, FB_RUNNING) != FB_NOT_STARTED)
++        return;
++    if (pthread_create(&thread, NULL, fb_present_thread, NULL) != 0) {
++        fprintf(stderr, "[FBWIN] presentation thread creation failed\n");
++        s_state = FB_CLOSED;
++        exit(1);
++    }
++    pthread_detach(thread);
++}
+ #endif
+diff --git a/src/video/video_player.c b/src/video/video_player.c
+index b45e1e0..39e81ca 100644
+--- a/src/video/video_player.c
++++ b/src/video/video_player.c
+@@ -724,6 +724,8 @@ int video_dump_frame_bmp(const char *path)
+ 
+ #else  /* !_WIN32 -- Media Foundation is the decoder, so there is none here. */
+ 
++#include "video_player.h"
++
+ int  video_init(void)            { return -1; }
+ void video_shutdown(void)        {}
+ int  video_open(const char *p)   { (void)p; return -1; }
