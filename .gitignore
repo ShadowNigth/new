@@ -19,6 +19,7 @@ __pycache__/
 *.xiso
 .env
 .env.*
-/releases/
+/releases/*
+!/releases/*.zip
 /.wine/
 /.proton/
